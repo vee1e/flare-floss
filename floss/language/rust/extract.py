@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import re
 import sys
 import logging
 import pathlib
@@ -34,6 +35,79 @@ from floss.language.utils import (
 logger = logging.getLogger(__name__)
 
 MIN_STR_LEN = 4
+
+# matches strings that contain recognisable word-like fragments
+_WORD_LIKE_RE = re.compile(
+    r"[a-z]{3}"        # 3+ consecutive lowercase letters
+    r"|[A-Z][a-z]{2}"  # CamelCase word start
+    r"|[a-z]+[A-Z]"    # camelCase transition
+    r"|[A-Z]{3}"       # 3+ uppercase letters
+    r"|[0-9]{3}"       # 3+ consecutive digits
+    r"|\.\w{2}"        # file extension pattern
+    r"|://"            # URL scheme
+    r"|\\[a-zA-Z]"     # path separator
+)
+
+# matches short strings that look like disassembly fragments
+_DISASM_RE = re.compile(
+    r"^[)(]?[A-Za-z]{1,2}\$"   # register/displacement notation
+    r"|^\)[A-Z][A-Za-z0-9]"    # parenthesized register reference
+)
+
+# matches alignment padding patterns
+_PADDING_RE = re.compile(r"^f{3,}\.?$")
+
+# matches short operand-like prefixes
+_OPERAND_PREFIX_RE = re.compile(r"^o[A-Z]")
+
+
+def _is_junk_string(s: str) -> bool:
+    """
+    Return True if the string looks like junk rather than a meaningful
+    human-readable string.
+
+    Junk in Rust binaries comes from pointer/length values and other binary
+    data that happens to fall in the printable ASCII range.
+    """
+    if not s:
+        return True
+
+    s_stripped = s.strip()
+    if not s_stripped:
+        return True
+
+    # disassembly fragments and alignment padding
+    if _DISASM_RE.search(s_stripped):
+        return True
+
+    if _PADDING_RE.match(s_stripped):
+        return True
+
+    if _OPERAND_PREFIX_RE.match(s_stripped) and len(s_stripped) <= 8:
+        return True
+
+    # short strings must contain a recognisable word-like fragment
+    if len(s_stripped) <= 8:
+        if len(s_stripped) <= 6 and s_stripped.endswith("@"):
+            return True
+
+        if not _WORD_LIKE_RE.search(s_stripped):
+            return True
+
+        return False
+
+    # longer strings must be predominantly readable characters
+    alnum_count = sum(1 for c in s_stripped if c.isalnum() or c in " _.-/\\:,;'\"()")
+    alnum_ratio = alnum_count / len(s_stripped)
+    if alnum_ratio < 0.5:
+        return True
+
+    return False
+
+
+def filter_junk_strings(strings: List[StaticString]) -> List[StaticString]:
+    """Filter out junk strings from the given list."""
+    return [s for s in strings if not _is_junk_string(s.string)]
 
 
 def fix_b2s_wide_strings(
@@ -204,7 +278,19 @@ def get_string_blob_strings(pe: pefile.PE, min_length: int) -> Iterable[StaticSt
 
         split_strings(static_strings, address, min_length)
 
-    return static_strings
+    # filter out junk strings and deduplicate
+    seen = set()
+    filtered = []
+    for s in static_strings:
+        key = (s.offset, s.string)
+        if key in seen:
+            continue
+        seen.add(key)
+        if _is_junk_string(s.string):
+            continue
+        filtered.append(s)
+
+    return filtered
 
 
 def main(argv=None):

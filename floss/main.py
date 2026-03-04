@@ -674,7 +674,12 @@ def main(argv=None) -> int:
 
     if results.analysis.enable_static_strings:
         logger.info("extracting static strings")
-        results.strings.static_strings = static_strings
+
+        if results.metadata.language == Language.RUST.value:
+            results.strings.static_strings = floss.language.rust.extract.filter_junk_strings(static_strings)
+        else:
+            results.strings.static_strings = static_strings
+
         results.metadata.runtime.static_strings = static_runtime
 
         if results.metadata.language == Language.GO.value:
@@ -700,8 +705,10 @@ def main(argv=None) -> int:
 
             # currently Rust strings are only extracted from the .rdata section
             rdata_strings = floss.language.rust.extract.get_static_strings_from_rdata(sample, static_strings)
-            results.strings.language_strings_missed = floss.language.utils.get_missed_strings(
-                rdata_strings, results.strings.language_strings, args.min_length
+            results.strings.language_strings_missed = floss.language.rust.extract.filter_junk_strings(
+                floss.language.utils.get_missed_strings(
+                    rdata_strings, results.strings.language_strings, args.min_length
+                )
             )
     if (
         results.analysis.enable_decoded_strings
