@@ -705,11 +705,10 @@ def main(argv=None) -> int:
 
             # currently Rust strings are only extracted from the .rdata section
             rdata_strings = floss.language.rust.extract.get_static_strings_from_rdata(sample, static_strings)
-            results.strings.language_strings_missed = floss.language.rust.extract.filter_junk_strings(
-                floss.language.utils.get_missed_strings(
-                    rdata_strings, results.strings.language_strings, args.min_length
-                )
+            missed_strings = floss.language.utils.get_missed_strings(
+                rdata_strings, results.strings.language_strings, args.min_length
             )
+            results.strings.language_strings_missed = floss.language.rust.extract.filter_junk_strings(missed_strings)
     if (
         results.analysis.enable_decoded_strings
         or results.analysis.enable_stack_strings

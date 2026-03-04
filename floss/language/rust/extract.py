@@ -278,19 +278,16 @@ def get_string_blob_strings(pe: pefile.PE, min_length: int) -> Iterable[StaticSt
 
         split_strings(static_strings, address, min_length)
 
-    # filter out junk strings and deduplicate
+    # deduplicate
     seen = set()
-    filtered = []
+    unique_strings = []
     for s in static_strings:
         key = (s.offset, s.string)
-        if key in seen:
-            continue
-        seen.add(key)
-        if _is_junk_string(s.string):
-            continue
-        filtered.append(s)
+        if key not in seen:
+            seen.add(key)
+            unique_strings.append(s)
 
-    return filtered
+    return filter_junk_strings(unique_strings)
 
 
 def main(argv=None):
