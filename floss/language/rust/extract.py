@@ -36,17 +36,6 @@ logger = logging.getLogger(__name__)
 
 MIN_STR_LEN = 4
 
-# matches strings that contain recognisable word-like fragments
-_WORD_LIKE_RE = re.compile(
-    r"[a-z]{3}"        # 3+ consecutive lowercase letters
-    r"|[A-Z][a-z]{2}"  # CamelCase word start
-    r"|[a-z]+[A-Z]"    # camelCase transition
-    r"|[A-Z]{3}"       # 3+ uppercase letters
-    r"|[0-9]{3}"       # 3+ consecutive digits
-    r"|\.\w{2}"        # file extension pattern
-    r"|://"            # URL scheme
-    r"|\\[a-zA-Z]"     # path separator
-)
 
 # matches short strings that look like disassembly fragments
 _DISASM_RE = re.compile(
@@ -89,9 +78,6 @@ def _is_junk_string(s: str) -> bool:
     # short strings must contain a recognisable word-like fragment
     if len(s_stripped) <= 8:
         if len(s_stripped) <= 6 and s_stripped.endswith("@"):
-            return True
-
-        if not _WORD_LIKE_RE.search(s_stripped):
             return True
 
         return False
