@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useMemo } from 'react';
+import React, { useState, useCallback, useMemo, useRef, useEffect } from 'react';
 import { useDropzone } from 'react-dropzone';
 import './App.css';
 import { type ResultDocument, type ResultLayout, type ResultString } from './types';
@@ -57,6 +57,30 @@ const Layout: React.FC<{ layout: ResultLayout; displayOptions: DisplayOptions }>
   );
 };
 
+const CheckItem: React.FC<{ label: string; count?: number; checked: boolean; onChange: () => void }> = ({ label, count, checked, onChange }) => (
+  <label className="check-item">
+    <input type="checkbox" checked={checked} onChange={onChange} />
+    <span className="check-box" />
+    <span>{label}</span>
+    {count !== undefined && <span className="check-count">{count}</span>}
+  </label>
+);
+
+/** Extract just the filename from a full path */
+const getFilename = (path: string): string => {
+  const parts = path.replace(/\\/g, '/').split('/');
+  return parts[parts.length - 1] || path;
+};
+
+/** Split a hash into fixed-width 32-char lines for clean rectangular display */
+const chunkHash = (hash: string, charsPerLine = 32): string[] => {
+  const lines: string[] = [];
+  for (let i = 0; i < hash.length; i += charsPerLine) {
+    lines.push(hash.substring(i, i + charsPerLine));
+  }
+  return lines;
+};
+
 const App: React.FC = () => {
   const [data, setData] = useState<ResultDocument | null>(null);
   const [searchTerm, setSearchTerm] = useState('');
@@ -72,31 +96,66 @@ const App: React.FC = () => {
   });
   const [copyFeedback, setCopyFeedback] = useState('');
 
+  // Resizable sidebar
+  const [sidebarWidth, setSidebarWidth] = useState(360);
+  const isDragging = useRef(false);
+  const handleRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const handleMouseMove = (e: MouseEvent) => {
+      if (!isDragging.current) return;
+      e.preventDefault();
+      const newWidth = Math.min(600, Math.max(260, e.clientX));
+      setSidebarWidth(newWidth);
+    };
+
+    const handleMouseUp = () => {
+      if (isDragging.current) {
+        isDragging.current = false;
+        document.body.classList.remove('resizing');
+        handleRef.current?.classList.remove('dragging');
+      }
+    };
+
+    document.addEventListener('mousemove', handleMouseMove);
+    document.addEventListener('mouseup', handleMouseUp);
+    return () => {
+      document.removeEventListener('mousemove', handleMouseMove);
+      document.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, []);
+
+  const handleResizeStart = useCallback(() => {
+    isDragging.current = true;
+    document.body.classList.add('resizing');
+    handleRef.current?.classList.add('dragging');
+  }, []);
+
   const processData = (jsonData: ResultDocument) => {
-      setData(jsonData);
-      setSearchTerm('');
-      setShowUntagged(true);
-      setShowStringsWithoutStructure(true);
-      setMinStringLength(jsonData.meta.min_str_len);
+    setData(jsonData);
+    setSearchTerm('');
+    setShowUntagged(true);
+    setShowStringsWithoutStructure(true);
+    setMinStringLength(jsonData.meta.min_str_len);
 
-      const allTags = new Set<string>();
-      const allStructures = new Set<string>();
-      const collect = (layout: ResultLayout) => {
-        layout.strings.forEach(s => {
-          s.tags.forEach(t => allTags.add(t));
-          if (s.structure) {
-            allStructures.add(s.structure);
-          }
-        });
-        layout.children.forEach(collect);
-      };
-      collect(jsonData.layout);
+    const allTags = new Set<string>();
+    const allStructures = new Set<string>();
+    const collect = (layout: ResultLayout) => {
+      layout.strings.forEach(s => {
+        s.tags.forEach(t => allTags.add(t));
+        if (s.structure) {
+          allStructures.add(s.structure);
+        }
+      });
+      layout.children.forEach(collect);
+    };
+    collect(jsonData.layout);
 
-      const defaultTags = Array.from(allTags).filter(
-        tag => tag !== '#code' && tag !== '#reloc'
-      );
-      setSelectedTags(defaultTags);
-      setSelectedStructures(Array.from(allStructures));
+    const defaultTags = Array.from(allTags).filter(
+      tag => tag !== '#code' && tag !== '#reloc'
+    );
+    setSelectedTags(defaultTags);
+    setSelectedStructures(Array.from(allStructures));
   }
 
   const onDrop = useCallback((acceptedFiles: File[]) => {
@@ -246,7 +305,7 @@ const App: React.FC = () => {
 
         const tagMatch = s.tags.length === 0
           ? showUntagged
-          : selectedTags.length === 0 ? false : s.tags.some(tag => selectedTags.includes(tag));
+          : selectedTags.length === 0 ? false : s.tags.every(tag => selectedTags.includes(tag));
         if (!tagMatch) return false;
 
         const structureMatch = !s.structure
@@ -308,142 +367,186 @@ const App: React.FC = () => {
 
   return (
     <div className="App" {...getRootProps()}>
-      <div className="controls">
-        <div className="app-header">
-          <h1 className="app-title">Quantumstrand Viewer</h1>
-          <div className="app-header-buttons">
-            <button className="preview-button" onClick={handlePreview}>Preview PMA03-03.exe</button>
-            <div className="file-upload-area">
-              <label htmlFor="file-upload" className="file-upload-label">
-                Upload JSON
-              </label>
-              <input {...getInputProps()} id="file-upload" />
-            </div>
+      {/* ---- Sidebar ---- */}
+      <div className="sidebar" style={{ width: sidebarWidth }}>
+        <div className="sidebar-header">
+          <h1 className="app-title">Quantumstrand</h1>
+          <div className="sidebar-header-buttons">
+            <button className="btn-ghost" onClick={handlePreview}>Preview</button>
+            <label htmlFor="file-upload" className="btn-ghost" style={{ cursor: 'pointer' }}>
+              Upload
+            </label>
+            <input {...getInputProps()} id="file-upload" />
           </div>
         </div>
 
-        {data && (
-          <>
-            <div className="metadata">
-              <p><strong>Path:</strong> {data.meta.sample.path}</p>
-              <p><strong>MD5:</strong> {data.meta.sample.md5}</p>
-              <p><strong>SHA256:</strong> {data.meta.sample.sha256}</p>
-              <p><strong>Timestamp:</strong> {new Date(data.meta.timestamp).toLocaleString()}</p>
-              <p><strong>Minimum String Length:</strong> {data.meta.min_str_len}</p>
-              <p><strong>Version:</strong> {data.meta.version}</p>
-            </div>
-
-            <div className="filters-container">
-                <div className="filter-group">
-                    <div className="filter-group-header">Tags</div>
-                    <div className="tag-actions">
-                        <button onClick={handleSelectAll}>Select All</button>
-                        <button onClick={handleSelectNone}>Select None</button>
-                        <button onClick={handleFocusView}>Focus View</button>
-                    </div>
-                    <div className="filter-group-content">
-                      {tagInfo.availableTags.map(tag => (
-                        <label key={tag}>
-                          <input
-                            type="checkbox"
-                            checked={selectedTags.includes(tag)}
-                            onChange={() => handleTagChange(tag)}
-                          />
-                          {tag} ({tagInfo.tagCounts[tag]})
-                        </label>
-                      ))}
-                      {tagInfo.untaggedCount > 0 && (
-                        <label key="untagged">
-                          <input
-                            type="checkbox"
-                            checked={showUntagged}
-                            onChange={() => setShowUntagged(p => !p)}
-                          />
-                          (untagged) ({tagInfo.untaggedCount})
-                        </label>
-                      )}
-                    </div>
+        <div className="sidebar-body">
+          {data && (
+            <>
+              {/* Metadata */}
+              <div className="metadata">
+                <div className="meta-row">
+                  <span className="meta-label">File</span>
+                  <span className="meta-value" title={data.meta.sample.path}>{getFilename(data.meta.sample.path)}</span>
                 </div>
-                <div className="filter-group">
-                    <div className="filter-group-header">Structures</div>
-                    <div className="filter-group-content">
-                      {structureInfo.availableStructures.map(structure => (
-                        <label key={structure}>
-                          <input
-                            type="checkbox"
-                            checked={selectedStructures.includes(structure)}
-                            onChange={() => handleStructureChange(structure)}
-                          />
-                          {structure} ({structureInfo.structureCounts[structure]})
-                        </label>
-                      ))}
-                      {structureInfo.withoutStructureCount > 0 && (
-                        <label key="no-structure">
-                          <input
-                            type="checkbox"
-                            checked={showStringsWithoutStructure}
-                            onChange={() => setShowStringsWithoutStructure(p => !p)}
-                          />
-                          (no structure) ({structureInfo.withoutStructureCount})
-                        </label>
-                      )}
-                    </div>
+                <div className="meta-row">
+                  <span className="meta-label">MD5</span>
+                  <span className="meta-value meta-hash">{chunkHash(data.meta.sample.md5).map((line, i) => <div key={i}>{line}</div>)}</span>
                 </div>
-                <div className="filter-group">
-                    <div className="filter-group-header">Show Columns</div>
-                    <div className="filter-group-content">
-                        <label>
-                            <input type="checkbox" checked={displayOptions.showTags} onChange={() => handleDisplayOptionChange('showTags')} /> Tags
-                        </label>
-                        <label>
-                            <input type="checkbox" checked={displayOptions.showEncoding} onChange={() => handleDisplayOptionChange('showEncoding')} /> Encoding
-                        </label>
-                        <label>
-                            <input type="checkbox" checked={displayOptions.showOffsetAndStructure} onChange={() => handleDisplayOptionChange('showOffsetAndStructure')} /> Offset & Structure
-                        </label>
-                    </div>
+                <div className="meta-row">
+                  <span className="meta-label">SHA256</span>
+                  <span className="meta-value meta-hash">{chunkHash(data.meta.sample.sha256).map((line, i) => <div key={i}>{line}</div>)}</span>
                 </div>
-            </div>
-
-            <div className="search-controls">
-              <input
-                type="search"
-                placeholder="Search strings..."
-                className="search-bar"
-                value={searchTerm}
-                onChange={handleSearchChange}
-              />
-              <div className="min-length-control">
-                <label htmlFor="min-length-input">Min. Length:</label>
-                <input
-                  id="min-length-input"
-                  type="number"
-                  value={minStringLength}
-                  onChange={handleMinLengthChange}
-                  min="0"
-                />
+                <div className="meta-row">
+                  <span className="meta-label">Time</span>
+                  <span className="meta-value">{new Date(data.meta.timestamp).toLocaleString()}</span>
+                </div>
+                <div className="meta-row">
+                  <span className="meta-label">Ver</span>
+                  <span className="meta-value">{data.meta.version}</span>
+                </div>
               </div>
-            </div>
 
-            <div className="actions-bar">
-                <div className="string-counts">
-                  Showing {visibleStringCount} of {tagInfo.totalStringCount} strings
+              {/* Search */}
+              <div className="search-section">
+                <div className="search-row">
+                  <input
+                    type="search"
+                    placeholder="Search..."
+                    className="search-input"
+                    value={searchTerm}
+                    onChange={handleSearchChange}
+                  />
+                  <div className="min-length-group">
+                    <span className="min-length-label">Min</span>
+                    <input
+                      className="min-length-input"
+                      type="number"
+                      value={minStringLength}
+                      onChange={handleMinLengthChange}
+                      min="0"
+                      onWheel={(e) => {
+                        e.preventDefault();
+                        setMinStringLength(prev => Math.max(0, prev + (e.deltaY < 0 ? 1 : -1)));
+                      }}
+                    />
+                  </div>
                 </div>
-                <div>
-                    <button className="copy-button" onClick={handleCopyStrings}>Copy Strings</button>
-                    {copyFeedback && <span className="copy-feedback">{copyFeedback}</span>}
+              </div>
+
+              {/* Tags Filter */}
+              <div className="filter-section">
+                <div className="filter-section-header">
+                  <span className="filter-section-title">Tags</span>
+                  <div className="filter-actions">
+                    <button className="filter-action-btn" onClick={handleSelectAll}>All</button>
+                    <button className="filter-action-btn" onClick={handleSelectNone}>None</button>
+                    <button className="filter-action-btn" onClick={handleFocusView}>Focus</button>
+                  </div>
                 </div>
+                <div className="filter-items">
+                  {tagInfo.availableTags.map(tag => (
+                    <CheckItem
+                      key={tag}
+                      label={tag}
+                      count={tagInfo.tagCounts[tag]}
+                      checked={selectedTags.includes(tag)}
+                      onChange={() => handleTagChange(tag)}
+                    />
+                  ))}
+                  {tagInfo.untaggedCount > 0 && (
+                    <CheckItem
+                      key="untagged"
+                      label="(untagged)"
+                      count={tagInfo.untaggedCount}
+                      checked={showUntagged}
+                      onChange={() => setShowUntagged(p => !p)}
+                    />
+                  )}
+                </div>
+              </div>
+
+              {/* Structures Filter */}
+              <div className="filter-section">
+                <div className="filter-section-header">
+                  <span className="filter-section-title">Structures</span>
+                </div>
+                <div className="filter-items">
+                  {structureInfo.availableStructures.map(structure => (
+                    <CheckItem
+                      key={structure}
+                      label={structure}
+                      count={structureInfo.structureCounts[structure]}
+                      checked={selectedStructures.includes(structure)}
+                      onChange={() => handleStructureChange(structure)}
+                    />
+                  ))}
+                  {structureInfo.withoutStructureCount > 0 && (
+                    <CheckItem
+                      key="no-structure"
+                      label="(none)"
+                      count={structureInfo.withoutStructureCount}
+                      checked={showStringsWithoutStructure}
+                      onChange={() => setShowStringsWithoutStructure(p => !p)}
+                    />
+                  )}
+                </div>
+              </div>
+
+              {/* Display Columns */}
+              <div className="filter-section">
+                <div className="filter-section-header">
+                  <span className="filter-section-title">Columns</span>
+                </div>
+                <div className="filter-items">
+                  <CheckItem label="Tags" checked={displayOptions.showTags} onChange={() => handleDisplayOptionChange('showTags')} />
+                  <CheckItem label="Encoding" checked={displayOptions.showEncoding} onChange={() => handleDisplayOptionChange('showEncoding')} />
+                  <CheckItem label="Offset & Structure" checked={displayOptions.showOffsetAndStructure} onChange={() => handleDisplayOptionChange('showOffsetAndStructure')} />
+                </div>
+              </div>
+            </>
+          )}
+        </div>
+
+        {/* Sidebar Footer */}
+        {data && (
+          <div className="sidebar-footer">
+            <span className="string-count">
+              <strong>{visibleStringCount}</strong>&nbsp;/&nbsp;{tagInfo.totalStringCount}
+            </span>
+            <div style={{ display: 'flex', alignItems: 'center' }}>
+              <button className="btn-copy" onClick={handleCopyStrings}>Copy</button>
+              {copyFeedback && <span className="copy-feedback">{copyFeedback}</span>}
             </div>
-          </>
+          </div>
         )}
       </div>
-      <div className="results-container">
+
+      {/* ---- Resize Handle ---- */}
+      <div
+        ref={handleRef}
+        className="resize-handle"
+        onMouseDown={handleResizeStart}
+      />
+
+      {/* ---- Main Content ---- */}
+      <div className="main-content">
         {!data ? (
-            <div className="welcome-message">Drop a JSON file or use the upload button to get started.</div>
+          <div className="welcome-state">
+            <div className="welcome-inner">
+              <p className="welcome-title">Quantumstrand Viewer</p>
+              <p className="welcome-sub">Drop a JSON file or use the upload button</p>
+            </div>
+          </div>
         ) : filteredLayout ? (
           <Layout layout={filteredLayout} displayOptions={displayOptions} />
         ) : (
-            <div className="welcome-message">No strings found matching your search and tag filters.</div>
+          <div className="welcome-state">
+            <div className="welcome-inner">
+              <p className="welcome-title">No matches</p>
+              <p className="welcome-sub">Try adjusting your search or filter settings</p>
+            </div>
+          </div>
         )}
       </div>
     </div>
