@@ -1081,6 +1081,12 @@ class PELayout(Layout):
     # file offsets of bytes that are recognized as code
     code_offsets: OffsetRanges
 
+    # file offsets of data referenced by code
+    code_referenced_offsets: Set[int] = Field(default_factory=set)
+
+    # True when operand-level reference analysis was completed.
+    has_code_references: bool = False
+
     structures_by_address: Dict[int, Structure]
 
     def tag_strings(self, taggers: Sequence[Tagger]):
@@ -1093,10 +1099,21 @@ class PELayout(Layout):
         def check_is_code_tagger(s: ExtractedString) -> Sequence[Tag]:
             return check_is_code(self.code_offsets, s)
 
+        def check_is_referenced_tagger(s: ExtractedString) -> Sequence[Tag]:
+            if not self.has_code_references:
+                return ()
+            if s.slice.range.offset in self.code_referenced_offsets:
+                return ("#code_referenced",)
+            elif not self.code_offsets.overlaps(s.slice.range.offset, s.slice.range.end - 1):
+                # not code, and not referenced by code
+                return ("#unreferenced",)
+            return ()
+
         taggers = tuple(taggers) + (
             check_is_xor_tagger,
             check_is_reloc_tagger,
             check_is_code_tagger,
+            check_is_referenced_tagger,
         )
 
         super().tag_strings(taggers)
@@ -1161,39 +1178,141 @@ def _merge_overlapping_ranges(ranges: List[Tuple[int, int]]) -> List[Tuple[int, 
     return merged_ranges
 
 
-def _get_code_ranges(ws: lancelot.Workspace, pe: pefile.PE, slice_: Slice) -> List[Tuple[int, int]]:
+
+def _analyze_code_ranges_and_references(
+    ws: lancelot.Workspace,
+    pe: pefile.PE,
+    slice_: Slice,
+    collect_references: bool = True,
+) -> Tuple[List[Tuple[int, int]], Set[int]]:
     """
-    Extract and return the raw, unmerged code ranges from a PE file.
+    Extract raw code ranges and file offsets of data referenced by code.
     """
     base_address = ws.base_address
 
-    # cache because getting the offset is slow
-    @functools.lru_cache(maxsize=None)
-    def get_offset_from_rva_cached(rva):
-        try:
-            return pe.get_offset_from_rva(rva)
-        except pefile.PEFormatError as e:
-            logger.warning("%s", str(e))
+    section_maps: List[Tuple[int, int, int]] = []
+    section_rvas: List[int] = []
+    max_mapped_rva = 0
+    for section in pe.sections:
+        rva = section.VirtualAddress
+        size = section.SizeOfRawData
+        if size <= 0:
+            continue
+        start = rva
+        end = rva + size
+        section_maps.append((start, end, section.get_PointerToRawData_adj()))
+        section_rvas.append(start)
+        max_mapped_rva = max(max_mapped_rva, end)
+
+    def rva_to_offset(rva: int) -> Optional[int]:
+        i = bisect.bisect_right(section_rvas, rva) - 1
+        if i < 0:
             return None
 
+        section_start, section_end, raw_start = section_maps[i]
+        if rva >= section_end:
+            return None
+
+        return raw_start + (rva - section_start)
+
     code_ranges: List[Tuple[int, int]] = []
-    for function in ws.get_functions():
-        cfg = ws.build_cfg(function)
+    referenced_offsets: Set[int] = set()
+    read_insn = ws.read_insn
+    get_functions = ws.get_functions
+    build_cfg = ws.build_cfg
+    operand_type_memory = lancelot.OPERAND_TYPE_MEMORY
+    operand_type_immediate = lancelot.OPERAND_TYPE_IMMEDIATE
+    contains_range = slice_.contains_range
+
+    for function in get_functions():
+        cfg = build_cfg(function)
         for bb in cfg.basic_blocks.values():
-            va = bb.address
-            rva = va - base_address
-            offset = get_offset_from_rva_cached(rva)
-            if offset is None:
+            bb_va = bb.address
+            bb_rva = bb_va - base_address
+            bb_offset = rva_to_offset(bb_rva)
+            if bb_offset is None:
                 continue
 
-            size = bb.length
-
-            if not slice_.contains_range(offset, size):
-                logger.warning("lancelot identified code at an invalid location, skipping basic block at 0x%x", rva)
+            bb_size = bb.length
+            if not contains_range(bb_offset, bb_size):
+                logger.warning(
+                    "lancelot identified code at an invalid location, skipping basic block at 0x%x",
+                    bb_rva,
+                )
                 continue
 
-            code_ranges.append((offset, offset + size - 1))
-    return code_ranges
+            code_ranges.append((bb_offset, bb_offset + bb_size - 1))
+
+            if collect_references:
+                va = bb_va
+                end_va = bb_va + bb_size
+                while va < end_va:
+                    insn = read_insn(va)
+                    if not insn:
+                        break
+
+                    for op in insn.operands:
+                        target_va = None
+                        if op[0] == operand_type_memory:
+                            base = op[2]
+                            index = op[3]
+                            disp = op[6]
+                            if base == "rip":
+                                target_va = va + insn.length + disp
+                            elif base is None and index is None:
+                                target_va = disp
+                        elif op[0] == operand_type_immediate:
+                            is_relative = op[2]
+                            value = op[3]
+                            if not is_relative:
+                                target_va = value
+
+                        if target_va is None or target_va <= base_address:
+                            continue
+
+                        target_rva = target_va - base_address
+                        if target_rva >= max_mapped_rva:
+                            continue
+
+                        target_offset = rva_to_offset(target_rva)
+                        if target_offset is not None and contains_range(target_offset, 1):
+                            referenced_offsets.add(target_offset)
+
+                    va += insn.length
+
+    return code_ranges, referenced_offsets
+
+
+def _pe_has_low_string_density(slice_: Slice, minimum_length: int = 4) -> bool:
+    """
+    Return True when the PE likely has sparse static strings in data sections.
+
+    This is used as a fast heuristic to skip expensive operand-level xref
+    analysis for binaries (like Go) where nearly every data blob looks
+    string-like and the #unreferenced tag is less actionable.
+    """
+    data = slice_.data
+    length = len(data)
+    if length == 0:
+        return True
+
+    i = 0
+    string_runs = 0
+    while i < length:
+        b = data[i]
+        if 32 <= b <= 126:
+            j = i + 1
+            while j < length and 32 <= data[j] <= 126:
+                j += 1
+            if j - i >= minimum_length:
+                string_runs += 1
+                if string_runs >= 120000:
+                    return True
+            i = j
+        else:
+            i += 1
+
+    return False
 
 
 def compute_pe_layout(slice: Slice, xor_key: int | None) -> Layout:
@@ -1222,9 +1341,17 @@ def compute_pe_layout(slice: Slice, xor_key: int | None) -> Layout:
 
     # contains the file offsets of bytes that are part of recognized instructions.
     code_offsets = OffsetRanges()
+    code_referenced_offsets: Set[int] = set()
+    has_code_references = False
     if ws:
-        with timing("lancelot: find code"):
-            code_ranges = _get_code_ranges(ws, pe, slice)
+        with timing("lancelot: analyze code"):
+            if _pe_has_low_string_density(slice):
+                code_ranges, _ = _analyze_code_ranges_and_references(ws, pe, slice, collect_references=False)
+                code_referenced_offsets = set()
+                logger.debug("perf: lancelot: skipped reference analysis for high-string-density PE")
+            else:
+                code_ranges, code_referenced_offsets = _analyze_code_ranges_and_references(ws, pe, slice)
+                has_code_references = True
             merged_code_ranges = _merge_overlapping_ranges(code_ranges)
             code_offsets = OffsetRanges.from_merged_ranges(merged_code_ranges)
 
@@ -1234,6 +1361,8 @@ def compute_pe_layout(slice: Slice, xor_key: int | None) -> Layout:
         xor_key=xor_key,
         reloc_offsets=reloc_offsets,
         code_offsets=code_offsets,
+        code_referenced_offsets=code_referenced_offsets,
+        has_code_references=has_code_references,
         structures_by_address=structures_by_address,
     )
 
@@ -2225,6 +2354,7 @@ def main():
             "#duplicate": "mute",
             "#code": "hide",
             "#reloc": "hide",
+            "#unreferenced": "mute",
             # lib strings are muted (default)
         }
         # hide (remove) strings according to the above rules
