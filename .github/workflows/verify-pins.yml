@@ -9,7 +9,8 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
+      workflows: write
     steps:
       - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
       - uses: suzuki-shunsuke/pinact-action@latest
