@@ -1,6 +1,10 @@
 name: Verify Action Pins
 
 on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/**"
   pull_request:
     paths:
       - ".github/workflows/**"
