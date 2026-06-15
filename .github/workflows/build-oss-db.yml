@@ -8,10 +8,18 @@ on:
   # Allow manual runs from the Actions tab.
   workflow_dispatch:
 
-  # Rebuild when the orchestration script or this workflow changes on master.
+  # Rebuild when the orchestration script or this workflow changes on quantumstrand.
   push:
     branches:
-      - master
+      - quantumstrand
+    paths:
+      - 'floss/qs/db/data/oss/build_oss_db.py'
+      - '.github/workflows/build-oss-db.yml'
+
+  # Run on PRs that touch the automation so it can be verified before merging.
+  pull_request:
+    branches:
+      - quantumstrand
     paths:
       - 'floss/qs/db/data/oss/build_oss_db.py'
       - '.github/workflows/build-oss-db.yml'
@@ -113,9 +121,11 @@ jobs:
         working-directory: flare-floss
 
       - name: Create Pull Request if databases changed
+        if: github.event_name != 'pull_request'
         uses: peter-evans/create-pull-request@v6
         with:
           path: flare-floss
+          base: quantumstrand
           commit-message: 'chore(oss-db): update string databases'
           title: 'Update OSS string databases'
           body: |
