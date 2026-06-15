@@ -1,0 +1,130 @@
+name: Build OSS String Databases
+
+on:
+  # Rebuild the databases every Sunday at 00:00 UTC.
+  schedule:
+    - cron: '0 0 * * 0'
+
+  # Allow manual runs from the Actions tab.
+  workflow_dispatch:
+
+  # Rebuild when the orchestration script or this workflow changes on main.
+  push:
+    branches:
+      - main
+    paths:
+      - 'floss/qs/db/data/oss/build_oss_db.py'
+      - '.github/workflows/build-oss-db.yml'
+
+# Cancel any in-progress run when a newer one starts.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  build-databases:
+    name: Build OSS string databases
+    runs-on: windows-latest
+
+    env:
+      # Workaround for zydis 3.1.3's CMakeLists.txt requiring an older
+      # cmake_minimum_required syntax. Remove once Lancelot updates zydis.
+      CMAKE_POLICY_VERSION_MINIMUM: '3.5'
+
+    steps:
+      - name: Checkout flare-floss
+        uses: actions/checkout@v4
+        with:
+          path: flare-floss
+
+      - name: Checkout lancelot
+        uses: actions/checkout@v4
+        with:
+          repository: williballenthin/lancelot
+          path: lancelot
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            lancelot/target/
+          key: ${{ runner.os }}-cargo-jh-${{ hashFiles('lancelot/**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-jh-
+
+      - name: Cache vcpkg
+        uses: actions/cache@v4
+        with:
+          path: |
+            C:\vcpkg\installed
+            C:\vcpkg\downloads
+          key: ${{ runner.os }}-vcpkg-oss-db-${{ hashFiles('flare-floss/floss/qs/db/data/oss/build_oss_db.py') }}
+          restore-keys: |
+            ${{ runner.os }}-vcpkg-oss-db-
+
+      - name: Build jh
+        run: |
+          cargo build --release -p lancelot-bin
+        working-directory: lancelot
+
+      - name: Build OSS databases
+        run: |
+          python floss/qs/db/data/oss/build_oss_db.py `
+            --triplet x64-windows-static `
+            --compiler msvc143 `
+            --libraries openssl cryptopp sqlite3 curl mbedtls `
+            --jh-path ..\lancelot\target\release\jh.exe `
+            --output-dir floss\qs\db\data\oss
+        working-directory: flare-floss
+
+      - name: Upload generated databases
+        uses: actions/upload-artifact@v4
+        with:
+          name: oss-databases
+          path: flare-floss/floss/qs/db/data/oss/*.jsonl.gz
+          if-no-files-found: error
+
+      - name: Upload metrics
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-metrics
+          path: flare-floss/floss/qs/db/data/oss/build_metrics.json
+          if-no-files-found: error
+
+      - name: Show metrics summary
+        run: |
+          Get-Content floss\qs\db\data\oss\build_metrics.json
+        working-directory: flare-floss
+
+      - name: Create Pull Request if databases changed
+        uses: peter-evans/create-pull-request@v6
+        with:
+          path: flare-floss
+          commit-message: 'chore(oss-db): update string databases'
+          title: 'Update OSS string databases'
+          body: |
+            Automated weekly rebuild of the OSS string databases.
+
+            - Triplet: `x64-windows-static`
+            - Compiler: `msvc143`
+            - Libraries: openssl, cryptopp, sqlite3, curl, mbedtls
+
+            See `build_metrics.json` in the artifacts for per-library entry counts.
+          branch: update-oss-string-databases
+          delete-branch: true

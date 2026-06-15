@@ -1,0 +1,659 @@
+#!/usr/bin/env python3
+"""
+Build OSS string databases from vcpkg static libraries.
+
+This script automates the "vcpkg & jh" technique described in readme.md:
+
+  1. install static libraries via vcpkg
+  2. extract string features (and function names) via jh
+  3. convert to JSONL and compress with gzip
+
+It is intentionally modular so the underlying extractor (jh today) can be
+swapped for a more minimal tool later without rewriting the orchestration.
+
+Example usage:
+
+  # Default: build the top 5 largest databases using x64-windows-static.
+  python build_oss_db.py --lancelot-dir ~/Projects/Mandiant/lancelot
+
+  # Build a specific library with a different triplet.
+  python build_oss_db.py --triplet x64-mingw-static --libraries openssl
+
+  # Inside a container where vcpkg/jh are already on PATH.
+  python build_oss_db.py --triplet x64-linux
+
+Environment variables (used as defaults when CLI flags are omitted):
+
+  VCPKG_ROOT          root directory of a vcpkg installation
+  LANCELOT_DIR        directory containing the lancelot source (for building jh)
+  JH_PATH             path to an existing jh binary
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import csv
+import sys
+import gzip
+import json
+import shutil
+import logging
+import pathlib
+import argparse
+import subprocess
+from typing import Set, List, Iterable, Optional
+from dataclasses import field, dataclass
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("build_oss_db")
+
+
+# Top 5 largest databases currently shipped in this directory.
+DEFAULT_LIBRARIES: List[str] = [
+    "openssl",
+    "cryptopp",
+    "sqlite3",
+    "curl",
+    "mbedtls",
+]
+
+# Matches the values documented in readme.md.
+DEFAULT_TRIPLET = "x64-windows-static"
+DEFAULT_COMPILER = "msvc143"
+DEFAULT_PROFILE = "release"
+
+
+class BuildError(Exception):
+    """Raised when a single library cannot be built; the caller decides whether to abort or continue."""
+
+
+@dataclass(frozen=True)
+class BuildConfig:
+    triplet: str
+    compiler: str
+    profile: str
+    libraries: List[str]
+    output_dir: pathlib.Path
+    vcpkg_root: Optional[pathlib.Path]
+    jh_path: Optional[pathlib.Path]
+    lancelot_dir: Optional[pathlib.Path]
+    emit_function_names: bool = True
+    deduplicate: bool = True
+
+
+@dataclass
+class LibraryMetrics:
+    library: str
+    version: str
+    triplet: str
+    num_objects: int = 0
+    num_functions: int = 0
+    num_string_entries: int = 0
+    num_function_name_entries: int = 0
+    total_entries: int = 0
+    duration_seconds: float = 0.0
+    error: Optional[str] = None
+
+    def as_dict(self) -> dict:
+        return {
+            "library": self.library,
+            "version": self.version,
+            "triplet": self.triplet,
+            "num_objects": self.num_objects,
+            "num_functions": self.num_functions,
+            "num_string_entries": self.num_string_entries,
+            "num_function_name_entries": self.num_function_name_entries,
+            "total_entries": self.total_entries,
+            "duration_seconds": round(self.duration_seconds, 2),
+            "error": self.error,
+        }
+
+
+def run(
+    cmd: List[str],
+    cwd: Optional[pathlib.Path] = None,
+    check: bool = True,
+    env: Optional[dict] = None,
+) -> subprocess.CompletedProcess:
+    """Run a subprocess and return its output."""
+    logger.debug("running: %s", " ".join(cmd))
+    merged_env = os.environ.copy()
+    if env:
+        merged_env.update(env)
+    result = subprocess.run(
+        cmd,
+        cwd=str(cwd) if cwd else None,
+        env=merged_env,
+        text=True,
+        capture_output=True,
+    )
+    if check and result.returncode != 0:
+        raise subprocess.CalledProcessError(
+            result.returncode,
+            cmd,
+            output=result.stdout,
+            stderr=result.stderr,
+        )
+    return result
+
+
+class Vcpkg:
+    """Thin wrapper around a vcpkg installation."""
+
+    def __init__(self, vcpkg_root: Optional[pathlib.Path] = None):
+        self.exe = self._find_executable(vcpkg_root)
+        self.root = self._resolve_root(vcpkg_root)
+        self.installed_dir = self.root / "installed"
+        self.info_dir = self.installed_dir / "vcpkg" / "info"
+
+    def _find_executable(self, vcpkg_root: Optional[pathlib.Path]) -> pathlib.Path:
+        # 1. Executable bundled inside the provided root.
+        if vcpkg_root:
+            for name in ("vcpkg.exe", "vcpkg"):
+                candidate = vcpkg_root / name
+                if candidate.exists():
+                    return candidate.resolve()
+
+        # 2. Executable on PATH.
+        exe = shutil.which("vcpkg")
+        if exe:
+            return pathlib.Path(exe).resolve()
+
+        # 3. Executable inside VCPKG_ROOT.
+        env_root = os.environ.get("VCPKG_ROOT")
+        if env_root:
+            for name in ("vcpkg.exe", "vcpkg"):
+                candidate = pathlib.Path(env_root) / name
+                if candidate.exists():
+                    return candidate.resolve()
+
+        raise FileNotFoundError("vcpkg not found. Set VCPKG_ROOT or pass --vcpkg-root.")
+
+    def _resolve_root(self, vcpkg_root: Optional[pathlib.Path]) -> pathlib.Path:
+        if vcpkg_root:
+            return vcpkg_root.resolve()
+
+        env_root = os.environ.get("VCPKG_ROOT")
+        if env_root:
+            return pathlib.Path(env_root).resolve()
+
+        # The executable normally lives at <vcpkg-root>/vcpkg.
+        return self.exe.parent.resolve()
+
+    def install(self, library: str, triplet: str) -> None:
+        """Install a library for the given triplet."""
+        spec = f"{library}:{triplet}"
+        logger.info("vcpkg install %s", spec)
+        run([str(self.exe), "install", spec])
+
+    def get_installed_version(self, library: str, triplet: str) -> str:
+        """Return the installed version string (e.g. '3.0.7#1')."""
+        result = run([str(self.exe), "list", f"{library}:{triplet}"])
+        expected_prefix = f"{library}:{triplet}"
+
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if not line or line.startswith("The following packages are"):
+                continue
+
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+
+            if parts[0] == expected_prefix:
+                return parts[1]
+
+        raise BuildError(f"could not determine installed version for {library}:{triplet}")
+
+    def find_package_libs(self, library: str, triplet: str) -> List[pathlib.Path]:
+        """Return static-library files (.lib/.a) owned by the given package."""
+        # vcpkg records installed files in <root>/installed/vcpkg/info/<package>_<version>_<triplet>.list
+        pattern = re.compile(re.escape(library) + r"_.*?_" + re.escape(triplet) + r"\.list$")
+        list_files = [p for p in self.info_dir.iterdir() if pattern.match(p.name)]
+
+        if not list_files:
+            # Fallback: scan the whole lib directory. This is less precise but works
+            # when the .list file cannot be located.
+            logger.warning(
+                "could not find vcpkg info .list for %s:%s; falling back to lib-dir scan",
+                library,
+                triplet,
+            )
+            return self._find_all_static_libs(triplet)
+
+        lib_paths: List[pathlib.Path] = []
+        for list_file in list_files:
+            for line in list_file.read_text().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                if line.startswith(triplet + "/lib/"):
+                    candidate = self.installed_dir / line
+                    if candidate.suffix in (".lib", ".a"):
+                        lib_paths.append(candidate)
+
+        if not lib_paths:
+            raise BuildError(f"no static libraries found for {library}:{triplet}")
+
+        return sorted(set(lib_paths))
+
+    def _find_all_static_libs(self, triplet: str) -> List[pathlib.Path]:
+        lib_dir = self.installed_dir / triplet / "lib"
+        if not lib_dir.exists():
+            return []
+        return sorted(p for p in lib_dir.iterdir() if p.suffix in (".lib", ".a"))
+
+
+class JHExtractor:
+    """Wrapper around the jh binary. Builds it from source if needed."""
+
+    def __init__(
+        self,
+        jh_path: Optional[pathlib.Path] = None,
+        lancelot_dir: Optional[pathlib.Path] = None,
+    ):
+        self.jh_path = self._resolve(jh_path, lancelot_dir)
+
+    def _resolve(
+        self,
+        jh_path: Optional[pathlib.Path],
+        lancelot_dir: Optional[pathlib.Path],
+    ) -> pathlib.Path:
+        if jh_path:
+            path = pathlib.Path(jh_path).resolve()
+            if not path.exists():
+                raise FileNotFoundError(f"jh binary not found: {path}")
+            return path
+
+        env_path = os.environ.get("JH_PATH")
+        if env_path:
+            path = pathlib.Path(env_path).resolve()
+            if path.exists():
+                return path
+
+        if lancelot_dir:
+            return self._build(lancelot_dir)
+
+        env_lancelot = os.environ.get("LANCELOT_DIR")
+        if env_lancelot:
+            return self._build(pathlib.Path(env_lancelot))
+
+        exe = shutil.which("jh")
+        if exe:
+            return pathlib.Path(exe).resolve()
+
+        raise FileNotFoundError("jh not found. Provide --jh-path, --lancelot-dir, or set JH_PATH.")
+
+    def _build(self, lancelot_dir: pathlib.Path) -> pathlib.Path:
+        logger.info("building jh from %s", lancelot_dir)
+        run(
+            ["cargo", "build", "--release", "-p", "lancelot-bin"],
+            cwd=lancelot_dir,
+        )
+        exe = lancelot_dir / "target" / "release" / "jh"
+        if sys.platform == "win32":
+            exe = exe.with_suffix(".exe")
+        if not exe.exists():
+            raise FileNotFoundError(f"jh binary not found after build: {exe}")
+        return exe.resolve()
+
+    def extract(
+        self,
+        lib_path: pathlib.Path,
+        library: str,
+        version: str,
+        triplet: str,
+        compiler: str,
+        profile: str,
+    ) -> str:
+        """Run jh on a single static library and return its CSV output."""
+        cmd = [
+            str(self.jh_path),
+            triplet,
+            compiler,
+            library,
+            version,
+            profile,
+            str(lib_path),
+        ]
+        result = run(cmd)
+        return result.stdout
+
+
+class Converter:
+    """Convert jh CSV output into a gzip-compressed JSONL database."""
+
+    def __init__(self, emit_function_names: bool = True, deduplicate: bool = True):
+        self.emit_function_names = emit_function_names
+        self.deduplicate = deduplicate
+
+    def convert(
+        self,
+        csv_text: str,
+        library: str,
+        version: str,
+        output_path: pathlib.Path,
+    ) -> dict:
+        """Convert CSV text to JSONL.gz. Returns entry counts."""
+        entries: List[dict] = []
+        function_names: Set[str] = set()
+        explicit_function_names: Set[str] = set()
+
+        reader = csv.reader(csv_text.splitlines())
+        for row in reader:
+            if not row or row[0].startswith("#"):
+                continue
+            if len(row) != 9:
+                logger.warning("skipping malformed CSV row: %s", row)
+                continue
+
+            (
+                _triplet,
+                _compiler,
+                _lib,
+                _ver,
+                _profile,
+                file_path,
+                function_name,
+                feat_type,
+                value,
+            ) = row
+
+            function_names.add(function_name)
+
+            if feat_type == "string":
+                if value.startswith('"'):
+                    value = json.loads(value)
+                entries.append(
+                    {
+                        "string": value,
+                        "library_name": library,
+                        "library_version": version,
+                        "file_path": file_path,
+                        "function_name": function_name,
+                        "line_number": None,
+                    }
+                )
+            elif feat_type == "function_name":
+                # Future-proof: a minimal extractor may emit function names explicitly.
+                if value.startswith('"'):
+                    value = json.loads(value)
+                entries.append(
+                    {
+                        "string": value,
+                        "library_name": library,
+                        "library_version": version,
+                        "file_path": file_path,
+                        "function_name": value,
+                        "line_number": None,
+                    }
+                )
+                explicit_function_names.add(value)
+
+        # Stock jh does not emit function_name rows, so derive them from the
+        # function column. Functions without any string/number/api features
+        # will be missed unless the extractor is patched to emit them.
+        if self.emit_function_names:
+            for fn in function_names - explicit_function_names:
+                entries.append(
+                    {
+                        "string": fn,
+                        "library_name": library,
+                        "library_version": version,
+                        "file_path": None,
+                        "function_name": fn,
+                        "line_number": None,
+                    }
+                )
+
+        if self.deduplicate:
+            # Match loader semantics: one metadata object per unique string.
+            seen: dict = {}
+            for entry in entries:
+                key = entry["string"]
+                if key not in seen:
+                    seen[key] = entry
+            entries = list(seen.values())
+
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with gzip.open(output_path, "wt", encoding="utf-8") as f:
+            for entry in entries:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+        num_string_entries = sum(
+            1 for e in entries if e["function_name"] is not None and e["function_name"] != e["string"]
+        )
+        num_function_name_entries = sum(
+            1 for e in entries if e["function_name"] is not None and e["function_name"] == e["string"]
+        )
+
+        return {
+            "num_string_entries": num_string_entries,
+            "num_function_name_entries": num_function_name_entries,
+            "total_entries": len(entries),
+        }
+
+
+def count_csv_rows(csv_text: str) -> dict:
+    """Count objects and unique functions referenced in jh CSV output."""
+    objects: Set[str] = set()
+    functions: Set[str] = set()
+    reader = csv.reader(csv_text.splitlines())
+    for row in reader:
+        if not row or row[0].startswith("#"):
+            continue
+        if len(row) < 8:
+            continue
+        file_path = row[5]
+        function_name = row[6]
+        objects.add(file_path)
+        functions.add(function_name)
+    return {"num_objects": len(objects), "num_functions": len(functions)}
+
+
+def build_library(
+    library: str,
+    config: BuildConfig,
+    vcpkg: Vcpkg,
+    jh: JHExtractor,
+    converter: Converter,
+) -> LibraryMetrics:
+    """Build a single library database."""
+    import time
+
+    start = time.time()
+    metrics = LibraryMetrics(
+        library=library,
+        version="unknown",
+        triplet=config.triplet,
+    )
+
+    try:
+        vcpkg.install(library, config.triplet)
+        version = vcpkg.get_installed_version(library, config.triplet)
+        metrics.version = version
+
+        lib_paths = vcpkg.find_package_libs(library, config.triplet)
+        logger.info(
+            "%s: found %d static library file(s): %s",
+            library,
+            len(lib_paths),
+            ", ".join(str(p.name) for p in lib_paths),
+        )
+
+        all_csv_parts: List[str] = []
+        for lib_path in lib_paths:
+            logger.info("%s: extracting strings from %s", library, lib_path.name)
+            csv_text = jh.extract(
+                lib_path,
+                library,
+                version,
+                config.triplet,
+                config.compiler,
+                config.profile,
+            )
+            all_csv_parts.append(csv_text)
+
+        combined_csv = "\n".join(all_csv_parts)
+        row_counts = count_csv_rows(combined_csv)
+        metrics.num_objects = row_counts["num_objects"]
+        metrics.num_functions = row_counts["num_functions"]
+
+        output_path = config.output_dir / f"{library}.jsonl.gz"
+        counts = converter.convert(combined_csv, library, version, output_path)
+        metrics.num_string_entries = counts["num_string_entries"]
+        metrics.num_function_name_entries = counts["num_function_name_entries"]
+        metrics.total_entries = counts["total_entries"]
+
+        logger.info(
+            "%s: wrote %s (%d entries)",
+            library,
+            output_path,
+            metrics.total_entries,
+        )
+    except Exception as exc:
+        logger.exception("%s: build failed", library)
+        metrics.error = f"{type(exc).__name__}: {exc}"
+    finally:
+        metrics.duration_seconds = time.time() - start
+
+    return metrics
+
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Build OSS string databases from vcpkg libraries.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--triplet",
+        default=os.environ.get("TRIPLET", DEFAULT_TRIPLET),
+        help="vcpkg triplet (default from $TRIPLET or readme.md value)",
+    )
+    parser.add_argument(
+        "--compiler",
+        default=os.environ.get("COMPILER", DEFAULT_COMPILER),
+        help="compiler label passed to jh",
+    )
+    parser.add_argument(
+        "--profile",
+        default=os.environ.get("PROFILE", DEFAULT_PROFILE),
+        help="build profile label passed to jh",
+    )
+    parser.add_argument(
+        "--libraries",
+        nargs="+",
+        default=os.environ.get("LIBRARIES", ",".join(DEFAULT_LIBRARIES)).split(","),
+        help="libraries to build",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=pathlib.Path,
+        default=pathlib.Path(__file__).parent,
+        help="directory for generated .jsonl.gz files and metrics",
+    )
+    parser.add_argument(
+        "--vcpkg-root",
+        type=pathlib.Path,
+        default=os.environ.get("VCPKG_ROOT", None),
+        help="vcpkg installation root",
+    )
+    parser.add_argument(
+        "--jh-path",
+        type=pathlib.Path,
+        default=os.environ.get("JH_PATH", None),
+        help="path to an existing jh binary",
+    )
+    parser.add_argument(
+        "--lancelot-dir",
+        type=pathlib.Path,
+        default=os.environ.get("LANCELOT_DIR", None),
+        help="directory containing lancelot source; jh will be built if --jh-path is not given",
+    )
+    parser.add_argument(
+        "--no-function-names",
+        action="store_true",
+        help="do not emit function-name-as-string entries",
+    )
+    parser.add_argument(
+        "--no-deduplicate",
+        action="store_true",
+        help="emit one JSON object per CSV row instead of one per unique string",
+    )
+    parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="continue building remaining libraries if one fails",
+    )
+    parser.add_argument(
+        "--log-level",
+        default=os.environ.get("LOG_LEVEL", "INFO"),
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="logging level",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = parse_args(argv)
+    logging.getLogger().setLevel(args.log_level.upper())
+
+    config = BuildConfig(
+        triplet=args.triplet,
+        compiler=args.compiler,
+        profile=args.profile,
+        libraries=[lib.strip() for lib in args.libraries if lib.strip()],
+        output_dir=args.output_dir.resolve(),
+        vcpkg_root=args.vcpkg_root.resolve() if args.vcpkg_root else None,
+        jh_path=args.jh_path.resolve() if args.jh_path else None,
+        lancelot_dir=args.lancelot_dir.resolve() if args.lancelot_dir else None,
+        emit_function_names=not args.no_function_names,
+        deduplicate=not args.no_deduplicate,
+    )
+
+    logger.info("configuration: %s", config)
+
+    vcpkg = Vcpkg(config.vcpkg_root)
+    jh = JHExtractor(config.jh_path, config.lancelot_dir)
+    converter = Converter(
+        emit_function_names=config.emit_function_names,
+        deduplicate=config.deduplicate,
+    )
+
+    config.output_dir.mkdir(parents=True, exist_ok=True)
+
+    metrics: List[LibraryMetrics] = []
+    failed = False
+    for library in config.libraries:
+        metric = build_library(library, config, vcpkg, jh, converter)
+        metrics.append(metric)
+        if metric.error:
+            failed = True
+            if not config.continue_on_error:
+                break
+
+    summary = {
+        "triplet": config.triplet,
+        "compiler": config.compiler,
+        "profile": config.profile,
+        "libraries": [m.as_dict() for m in metrics],
+        "successful": sum(1 for m in metrics if not m.error),
+        "failed": sum(1 for m in metrics if m.error),
+    }
+
+    metrics_path = config.output_dir / "build_metrics.json"
+    metrics_path.write_text(json.dumps(summary, indent=2))
+    logger.info("wrote metrics to %s", metrics_path)
+
+    if failed:
+        logger.error("one or more libraries failed to build")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
