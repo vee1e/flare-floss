@@ -661,7 +661,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     metrics_path.write_text(json.dumps(summary, indent=2))
     logger.info("wrote metrics to %s", metrics_path)
 
+    successful_count = summary["successful"]
     if failed:
+        if config.continue_on_error and successful_count > 0:
+            logger.warning(
+                "%d/%d libraries failed but --continue-on-error was set; "
+                "proceeding with partial results",
+                summary["failed"],
+                len(config.libraries),
+            )
+            return 0
         logger.error("one or more libraries failed to build")
         return 1
     return 0
