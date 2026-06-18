@@ -94,9 +94,7 @@ jobs:
       - name: Build OSS databases
         run: |
           python floss/qs/db/data/oss/build_oss_db.py `
-            --triplet x64-windows-static `
-            --compiler msvc143 `
-            --libraries openssl sqlite3 curl mbedtls jemalloc `
+            --config floss\qs\db\data\oss\libraries.json `
             --jh-path ..\lancelot\target\release\jh.exe `
             --output-dir floss\qs\db\data\oss `
             --continue-on-error

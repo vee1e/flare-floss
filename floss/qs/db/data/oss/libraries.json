@@ -1,0 +1,12 @@
+{
+  "triplet": "x64-windows-static",
+  "compiler": "msvc143",
+  "profile": "release",
+  "libraries": [
+    "openssl",
+    "sqlite3",
+    "curl",
+    "mbedtls",
+    "jemalloc"
+  ]
+}

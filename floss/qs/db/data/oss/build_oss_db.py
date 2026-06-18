@@ -537,30 +537,59 @@ def build_library(
     return metrics
 
 
+def load_config(path: pathlib.Path) -> dict:
+    """Load build configuration from a JSON file."""
+    data = json.loads(path.read_text())
+    if not isinstance(data, dict):
+        raise ValueError(f"config file {path} must contain a JSON object")
+    return data
+
+
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    # First pass: figure out if a config file was provided.
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--config", type=pathlib.Path, default=None)
+    pre_args, _ = pre_parser.parse_known_args(argv)
+
+    config: dict = {}
+    if pre_args.config:
+        config = load_config(pre_args.config)
+    elif "CONFIG" in os.environ:
+        config = load_config(pathlib.Path(os.environ["CONFIG"]))
+
+    # Defaults are taken from (lowest to highest precedence):
+    #   built-in constants < config file < environment variables < CLI args
+    defaults = {
+        "triplet": config.get("triplet", os.environ.get("TRIPLET", DEFAULT_TRIPLET)),
+        "compiler": config.get("compiler", os.environ.get("COMPILER", DEFAULT_COMPILER)),
+        "profile": config.get("profile", os.environ.get("PROFILE", DEFAULT_PROFILE)),
+        "libraries": config.get(
+            "libraries",
+            os.environ.get("LIBRARIES", ",".join(DEFAULT_LIBRARIES)).split(","),
+        ),
+    }
+
     parser = argparse.ArgumentParser(
         description="Build OSS string databases from vcpkg libraries.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        parents=[pre_parser],
     )
+    parser.set_defaults(**defaults)
     parser.add_argument(
         "--triplet",
-        default=os.environ.get("TRIPLET", DEFAULT_TRIPLET),
-        help="vcpkg triplet (default from $TRIPLET or readme.md value)",
+        help="vcpkg triplet",
     )
     parser.add_argument(
         "--compiler",
-        default=os.environ.get("COMPILER", DEFAULT_COMPILER),
         help="compiler label passed to jh",
     )
     parser.add_argument(
         "--profile",
-        default=os.environ.get("PROFILE", DEFAULT_PROFILE),
         help="build profile label passed to jh",
     )
     parser.add_argument(
         "--libraries",
         nargs="+",
-        default=os.environ.get("LIBRARIES", ",".join(DEFAULT_LIBRARIES)).split(","),
         help="libraries to build",
     )
     parser.add_argument(
