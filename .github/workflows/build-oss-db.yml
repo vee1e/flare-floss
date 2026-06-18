@@ -102,22 +102,6 @@ jobs:
             --continue-on-error
         working-directory: flare-floss
 
-      - name: Upload generated databases
-        if: success() || failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: oss-databases
-          path: flare-floss/floss/qs/db/data/oss/*.jsonl.gz
-          if-no-files-found: error
-
-      - name: Upload metrics
-        if: success() || failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-metrics
-          path: flare-floss/floss/qs/db/data/oss/build_metrics.json
-          if-no-files-found: error
-
       - name: Show metrics summary
         if: success() || failure()
         run: |
@@ -139,6 +123,6 @@ jobs:
             - Compiler: `msvc143`
             - Libraries: openssl, sqlite3, curl, mbedtls, jemalloc
 
-            See `build_metrics.json` in the artifacts for per-library entry counts.
+            See `floss/qs/db/data/oss/build_metrics.json` for per-library entry counts.
           branch: update-oss-string-databases
           delete-branch: true
