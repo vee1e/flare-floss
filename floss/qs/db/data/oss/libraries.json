@@ -5,7 +5,6 @@
   "libraries": [
     "brotli",
     "bzip2",
-    "cryptopp",
     "curl",
     "detours",
     "jemalloc",
