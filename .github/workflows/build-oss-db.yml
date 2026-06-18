@@ -109,7 +109,6 @@ jobs:
         working-directory: flare-floss
 
       - name: Create Pull Request if databases changed
-        if: github.event_name != 'pull_request'
         uses: peter-evans/create-pull-request@v6
         with:
           path: flare-floss
