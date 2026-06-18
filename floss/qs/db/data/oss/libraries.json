@@ -3,10 +3,22 @@
   "compiler": "msvc143",
   "profile": "release",
   "libraries": [
+    "brotli",
+    "bzip2",
+    "cryptopp",
+    "curl",
+    "detours",
+    "jemalloc",
+    "jsoncpp",
+    "kcp",
+    "liblzma",
+    "libpcap",
+    "libsodium",
+    "mbedtls",
     "openssl",
     "sqlite3",
-    "curl",
-    "mbedtls",
-    "jemalloc"
+    "tomcrypt",
+    "wolfssl",
+    "zlib"
   ]
 }
