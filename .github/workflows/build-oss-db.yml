@@ -96,7 +96,7 @@ jobs:
           python floss/qs/db/data/oss/build_oss_db.py `
             --triplet x64-windows-static `
             --compiler msvc143 `
-            --libraries openssl cryptopp sqlite3 curl mbedtls `
+            --libraries openssl sqlite3 curl mbedtls jemalloc `
             --jh-path ..\lancelot\target\release\jh.exe `
             --output-dir floss\qs\db\data\oss `
             --continue-on-error
@@ -137,7 +137,7 @@ jobs:
 
             - Triplet: `x64-windows-static`
             - Compiler: `msvc143`
-            - Libraries: openssl, cryptopp, sqlite3, curl, mbedtls
+            - Libraries: openssl, sqlite3, curl, mbedtls, jemalloc
 
             See `build_metrics.json` in the artifacts for per-library entry counts.
           branch: update-oss-string-databases

@@ -52,13 +52,15 @@ logging.basicConfig(
 logger = logging.getLogger("build_oss_db")
 
 
-# Top 5 largest databases currently shipped in this directory.
+# Largest databases currently shipped in this directory.
+# cryptopp is excluded because Lancelot's COFF loader panics on its weak
+# external symbols (see williballenthin/lancelot issue). Re-add once fixed.
 DEFAULT_LIBRARIES: List[str] = [
     "openssl",
-    "cryptopp",
     "sqlite3",
     "curl",
     "mbedtls",
+    "jemalloc",
 ]
 
 # Matches the values documented in readme.md.
@@ -661,16 +663,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     metrics_path.write_text(json.dumps(summary, indent=2))
     logger.info("wrote metrics to %s", metrics_path)
 
-    successful_count = summary["successful"]
     if failed:
-        if config.continue_on_error and successful_count > 0:
-            logger.warning(
-                "%d/%d libraries failed but --continue-on-error was set; "
-                "proceeding with partial results",
-                summary["failed"],
-                len(config.libraries),
-            )
-            return 0
         logger.error("one or more libraries failed to build")
         return 1
     return 0
