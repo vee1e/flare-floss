@@ -83,6 +83,7 @@ class BuildConfig:
     lancelot_dir: Optional[pathlib.Path]
     emit_function_names: bool = True
     deduplicate: bool = True
+    continue_on_error: bool = False
 
 
 @dataclass
@@ -320,7 +321,17 @@ class JHExtractor:
             profile,
             str(lib_path),
         ]
-        result = run(cmd)
+        try:
+            result = run(cmd)
+        except subprocess.CalledProcessError as exc:
+            logger.error(
+                "jh failed for %s (%s): stdout=%r stderr=%r",
+                library,
+                lib_path.name,
+                exc.stdout,
+                exc.stderr,
+            )
+            raise
         return result.stdout
 
 
@@ -613,6 +624,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         lancelot_dir=args.lancelot_dir.resolve() if args.lancelot_dir else None,
         emit_function_names=not args.no_function_names,
         deduplicate=not args.no_deduplicate,
+        continue_on_error=args.continue_on_error,
     )
 
     logger.info("configuration: %s", config)

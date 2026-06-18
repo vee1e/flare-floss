@@ -98,10 +98,12 @@ jobs:
             --compiler msvc143 `
             --libraries openssl cryptopp sqlite3 curl mbedtls `
             --jh-path ..\lancelot\target\release\jh.exe `
-            --output-dir floss\qs\db\data\oss
+            --output-dir floss\qs\db\data\oss `
+            --continue-on-error
         working-directory: flare-floss
 
       - name: Upload generated databases
+        if: success() || failure()
         uses: actions/upload-artifact@v4
         with:
           name: oss-databases
@@ -109,6 +111,7 @@ jobs:
           if-no-files-found: error
 
       - name: Upload metrics
+        if: success() || failure()
         uses: actions/upload-artifact@v4
         with:
           name: build-metrics
@@ -116,6 +119,7 @@ jobs:
           if-no-files-found: error
 
       - name: Show metrics summary
+        if: success() || failure()
         run: |
           Get-Content floss\qs\db\data\oss\build_metrics.json
         working-directory: flare-floss
