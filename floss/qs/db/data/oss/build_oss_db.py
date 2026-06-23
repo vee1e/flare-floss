@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import os
 import re
-import csv
 import sys
 import gzip
 import json
@@ -338,7 +337,7 @@ class JHExtractor:
 
 
 class Converter:
-    """Convert jh CSV output into a gzip-compressed JSONL database."""
+    """Convert jh JSONL output into a gzip-compressed JSONL database."""
 
     def __init__(self, emit_function_names: bool = True, deduplicate: bool = True):
         self.emit_function_names = emit_function_names
@@ -346,41 +345,37 @@ class Converter:
 
     def convert(
         self,
-        csv_text: str,
+        jh_text: str,
         library: str,
         version: str,
         output_path: pathlib.Path,
     ) -> dict:
-        """Convert CSV text to JSONL.gz. Returns entry counts."""
+        """Convert jh JSONL text to JSONL.gz. Returns entry counts."""
         entries: List[dict] = []
         function_names: Set[str] = set()
         explicit_function_names: Set[str] = set()
 
-        reader = csv.reader(csv_text.splitlines())
-        for row in reader:
-            if not row or row[0].startswith("#"):
+        for line in jh_text.splitlines():
+            line = line.strip()
+            if not line:
                 continue
-            if len(row) != 9:
-                logger.warning("skipping malformed CSV row: %s", row)
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                logger.warning("skipping malformed JSONL line: %s (%s)", line, exc)
                 continue
 
-            (
-                _triplet,
-                _compiler,
-                _lib,
-                _ver,
-                _profile,
-                file_path,
-                function_name,
-                feat_type,
-                value,
-            ) = row
+            file_path = row.get("path")
+            function_name = row.get("function")
+            feat_type = row.get("type")
+            value = row.get("value")
+
+            if not function_name:
+                continue
 
             function_names.add(function_name)
 
             if feat_type == "string":
-                if value.startswith('"'):
-                    value = json.loads(value)
                 entries.append(
                     {
                         "string": value,
@@ -393,8 +388,6 @@ class Converter:
                 )
             elif feat_type == "function_name":
                 # Future-proof: a minimal extractor may emit function names explicitly.
-                if value.startswith('"'):
-                    value = json.loads(value)
                 entries.append(
                     {
                         "string": value,
@@ -451,20 +444,23 @@ class Converter:
         }
 
 
-def count_csv_rows(csv_text: str) -> dict:
-    """Count objects and unique functions referenced in jh CSV output."""
+def count_jsonl_rows(jh_text: str) -> dict:
+    """Count objects and unique functions referenced in jh JSONL output."""
     objects: Set[str] = set()
     functions: Set[str] = set()
-    reader = csv.reader(csv_text.splitlines())
-    for row in reader:
-        if not row or row[0].startswith("#"):
+    for line in jh_text.splitlines():
+        line = line.strip()
+        if not line:
             continue
-        if len(row) < 8:
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError:
             continue
-        file_path = row[5]
-        function_name = row[6]
-        objects.add(file_path)
-        functions.add(function_name)
+        file_path = row.get("path")
+        function_name = row.get("function")
+        if function_name:
+            objects.add(file_path)
+            functions.add(function_name)
     return {"num_objects": len(objects), "num_functions": len(functions)}
 
 
@@ -498,10 +494,10 @@ def build_library(
             ", ".join(str(p.name) for p in lib_paths),
         )
 
-        all_csv_parts: List[str] = []
+        all_jh_parts: List[str] = []
         for lib_path in lib_paths:
             logger.info("%s: extracting strings from %s", library, lib_path.name)
-            csv_text = jh.extract(
+            jh_text = jh.extract(
                 lib_path,
                 library,
                 version,
@@ -509,15 +505,15 @@ def build_library(
                 config.compiler,
                 config.profile,
             )
-            all_csv_parts.append(csv_text)
+            all_jh_parts.append(jh_text)
 
-        combined_csv = "\n".join(all_csv_parts)
-        row_counts = count_csv_rows(combined_csv)
+        combined_jh_text = "\n".join(all_jh_parts)
+        row_counts = count_jsonl_rows(combined_jh_text)
         metrics.num_objects = row_counts["num_objects"]
         metrics.num_functions = row_counts["num_functions"]
 
         output_path = config.output_dir / f"{library}.jsonl.gz"
-        counts = converter.convert(combined_csv, library, version, output_path)
+        counts = converter.convert(combined_jh_text, library, version, output_path)
         metrics.num_string_entries = counts["num_string_entries"]
         metrics.num_function_name_entries = counts["num_function_name_entries"]
         metrics.total_entries = counts["total_entries"]

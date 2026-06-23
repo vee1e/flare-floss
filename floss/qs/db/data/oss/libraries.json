@@ -6,7 +6,6 @@
     "libev",
     "libevent",
     "libhv",
-    "boost",
     "poco"
   ]
 }
