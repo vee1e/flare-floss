@@ -1,0 +1,96 @@
+From bec4d9e53622525820c0d485b198227153df4bc4 Mon Sep 17 00:00:00 2001
+From: vee1e <vermalucky2004@gmail.com>
+Date: Tue, 23 Jun 2026 20:33:17 +0530
+Subject: [PATCH] jh: emit JSONL instead of hand-rolled CSV
+
+---
+ bin/src/bin/jh.rs | 53 ++++++++++++++++++++++++++++++++++-------------
+ 1 file changed, 39 insertions(+), 14 deletions(-)
+
+diff --git a/bin/src/bin/jh.rs b/bin/src/bin/jh.rs
+index 2ecf7df..b22db2c 100644
+--- a/bin/src/bin/jh.rs
++++ b/bin/src/bin/jh.rs
+@@ -314,27 +314,54 @@ struct BuildSettings {
+ fn output_functions_features(build: &BuildSettings, path: &str, features: &FunctionsFeatures) -> Result<()> {
+     for desc in features.values() {
+         for v in desc.features.numbers.iter() {
+-            print!(
+-                "{},{},{},{},{},",
+-                build.triplet, build.compiler, build.library, build.version, build.profile
++            println!(
++                "{}",
++                json!({
++                    "triplet": build.triplet,
++                    "compiler": build.compiler,
++                    "library": build.library,
++                    "version": build.version,
++                    "profile": build.profile,
++                    "path": path,
++                    "function": desc.name,
++                    "type": "number",
++                    "value": format!("0x{:08x}", v),
++                })
+             );
+-            println!("{},{},number,0x{:08x}", path, desc.name, v);
+         }
+ 
+         for v in desc.features.apis.iter() {
+-            print!(
+-                "{},{},{},{},{},",
+-                build.triplet, build.compiler, build.library, build.version, build.profile
++            println!(
++                "{}",
++                json!({
++                    "triplet": build.triplet,
++                    "compiler": build.compiler,
++                    "library": build.library,
++                    "version": build.version,
++                    "profile": build.profile,
++                    "path": path,
++                    "function": desc.name,
++                    "type": "api",
++                    "value": v,
++                })
+             );
+-            println!("{},{},api,{}", path, desc.name, v);
+         }
+ 
+         for v in desc.features.strings.iter() {
+-            print!(
+-                "{},{},{},{},{},",
+-                build.triplet, build.compiler, build.library, build.version, build.profile
++            println!(
++                "{}",
++                json!({
++                    "triplet": build.triplet,
++                    "compiler": build.compiler,
++                    "library": build.library,
++                    "version": build.version,
++                    "profile": build.profile,
++                    "path": path,
++                    "function": desc.name,
++                    "type": "string",
++                    "value": v,
++                })
+             );
+-            println!("{},{},string,{}", path, desc.name, json!(v));
+         }
+     }
+ 
+@@ -425,12 +452,10 @@ fn _main() -> Result<()> {
+ 
+         let features = extract_buf_features(config.clone(), &buf)?;
+ 
+-        println!("# triplet,compiler,library,version,profile,path,function,type,value");
+         output_functions_features(&build, "/", &features)?;
+     } else if buf.starts_with(b"!<arch>\n") {
+         // archive file
+ 
+-        println!("# triplet,compiler,library,version,profile,path,function,type,value");
+         let mut ar = ar::Archive::new(buf.as_slice());
+         while let Some(entry_result) = ar.next_entry() {
+             let mut entry = match entry_result {
+-- 
+2.54.0
+
