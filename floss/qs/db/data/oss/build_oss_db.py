@@ -72,6 +72,10 @@ class BuildError(Exception):
     """Raised when a single library cannot be built; the caller decides whether to abort or continue."""
 
 
+class UnsupportedPlatformError(BuildError):
+    """Raised when a library does not support the target triplet/platform."""
+
+
 @dataclass(frozen=True)
 class BuildConfig:
     triplet: str
@@ -190,7 +194,15 @@ class Vcpkg:
         """Install a library for the given triplet."""
         spec = f"{library}:{triplet}"
         logger.info("vcpkg install %s", spec)
-        run([str(self.exe), "install", spec])
+        try:
+            run([str(self.exe), "install", spec])
+        except subprocess.CalledProcessError as exc:
+            output = (exc.stdout or "") + (exc.stderr or "")
+            if "is only supported on" in output:
+                raise UnsupportedPlatformError(
+                    f"{spec} is not supported on this platform"
+                ) from exc
+            raise
 
     def get_installed_version(self, library: str, triplet: str) -> str:
         """Return the installed version string (e.g. '3.0.7#1')."""
@@ -237,9 +249,6 @@ class Vcpkg:
                     candidate = self.installed_dir / line
                     if candidate.suffix in (".lib", ".a"):
                         lib_paths.append(candidate)
-
-        if not lib_paths:
-            raise BuildError(f"no static libraries found for {library}:{triplet}")
 
         return sorted(set(lib_paths))
 
@@ -487,12 +496,20 @@ def build_library(
         metrics.version = version
 
         lib_paths = vcpkg.find_package_libs(library, config.triplet)
-        logger.info(
-            "%s: found %d static library file(s): %s",
-            library,
-            len(lib_paths),
-            ", ".join(str(p.name) for p in lib_paths),
-        )
+        if not lib_paths:
+            logger.info(
+                "%s: no static libraries found for %s:%s (likely header-only); skipping extraction",
+                library,
+                library,
+                config.triplet,
+            )
+        else:
+            logger.info(
+                "%s: found %d static library file(s): %s",
+                library,
+                len(lib_paths),
+                ", ".join(str(p.name) for p in lib_paths),
+            )
 
         all_jh_parts: List[str] = []
         for lib_path in lib_paths:
@@ -518,12 +535,18 @@ def build_library(
         metrics.num_function_name_entries = counts["num_function_name_entries"]
         metrics.total_entries = counts["total_entries"]
 
-        logger.info(
-            "%s: wrote %s (%d entries)",
-            library,
-            output_path,
-            metrics.total_entries,
-        )
+        if metrics.total_entries == 0 and output_path.exists():
+            output_path.unlink()
+            logger.info("%s: removed empty database %s", library, output_path)
+        else:
+            logger.info(
+                "%s: wrote %s (%d entries)",
+                library,
+                output_path,
+                metrics.total_entries,
+            )
+    except UnsupportedPlatformError as exc:
+        logger.warning("%s: skipping unsupported library (%s)", library, exc)
     except Exception as exc:
         logger.exception("%s: build failed", library)
         metrics.error = f"{type(exc).__name__}: {exc}"
@@ -625,7 +648,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--continue-on-error",
         action="store_true",
-        help="continue building remaining libraries if one fails",
+        help="continue building remaining libraries if one fails and exit successfully",
     )
     parser.add_argument(
         "--log-level",
@@ -690,6 +713,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if failed:
         logger.error("one or more libraries failed to build")
+        if config.continue_on_error:
+            return 0
         return 1
     return 0
 
