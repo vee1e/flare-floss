@@ -55,10 +55,6 @@ jobs:
           repository: williballenthin/lancelot
           path: lancelot
 
-      - name: Apply jh JSONL patch
-        run: git apply ../flare-floss/.github/patches/jh-jsonl.patch
-        working-directory: lancelot
-
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
@@ -109,25 +105,6 @@ jobs:
         run: |
           Get-Content floss\qs\db\data\oss\build_metrics.json
         working-directory: flare-floss
-
-      - name: Zip databases for download
-        if: success() || failure()
-        run: |
-          $files = Get-ChildItem -Path floss\qs\db\data\oss -Filter *.jsonl.gz
-          if ($files) {
-            Compress-Archive -Path $files.FullName -DestinationPath floss\qs\db\data\oss\oss-string-databases.zip -Force
-          } else {
-            New-Item -ItemType File -Path floss\qs\db\data\oss\oss-string-databases.zip -Force | Out-Null
-          }
-        working-directory: flare-floss
-
-      - name: Upload database artifact
-        if: success() || failure()
-        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808 # v4.3.3
-        with:
-          name: oss-string-databases
-          path: flare-floss/floss/qs/db/data/oss/oss-string-databases.zip
-          if-no-files-found: ignore
 
       - name: Create Pull Request if databases changed
         uses: peter-evans/create-pull-request@c5a7806660adbe173f04e3e038b0ccdcd758773c # v6.1.0
