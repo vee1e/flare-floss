@@ -1,0 +1,81 @@
+{
+  "triplet": "x64-windows-static",
+  "compiler": "msvc143",
+  "profile": "release",
+  "libraries": [
+    {
+      "library": "openssl",
+      "version": "3.6.2",
+      "triplet": "x64-windows-static",
+      "num_objects": 1052,
+      "num_functions": 14677,
+      "num_string_entries": 3640,
+      "num_function_name_entries": 14155,
+      "num_raw_entries": 17876,
+      "num_shared_removed": 81,
+      "total_entries": 17795,
+      "duration_seconds": 110.21,
+      "error": null
+    },
+    {
+      "library": "sqlite3",
+      "version": "3.53.2",
+      "triplet": "x64-windows-static",
+      "num_objects": 1,
+      "num_functions": 2027,
+      "num_string_entries": 598,
+      "num_function_name_entries": 2026,
+      "num_raw_entries": 2650,
+      "num_shared_removed": 26,
+      "total_entries": 2624,
+      "duration_seconds": 14.76,
+      "error": null
+    },
+    {
+      "library": "curl",
+      "version": "8.20.0#2",
+      "triplet": "x64-windows-static",
+      "num_objects": 137,
+      "num_functions": 1911,
+      "num_string_entries": 1578,
+      "num_function_name_entries": 1908,
+      "num_raw_entries": 3545,
+      "num_shared_removed": 59,
+      "total_entries": 3486,
+      "duration_seconds": 17.26,
+      "error": null
+    },
+    {
+      "library": "mbedtls",
+      "version": "3.6.5",
+      "triplet": "x64-windows-static",
+      "num_objects": 96,
+      "num_functions": 1878,
+      "num_string_entries": 1325,
+      "num_function_name_entries": 1771,
+      "num_raw_entries": 3136,
+      "num_shared_removed": 40,
+      "total_entries": 3096,
+      "duration_seconds": 12.03,
+      "error": null
+    },
+    {
+      "library": "jemalloc",
+      "version": "5.3.1",
+      "triplet": "x64-windows-static",
+      "num_objects": 63,
+      "num_functions": 1554,
+      "num_string_entries": 570,
+      "num_function_name_entries": 1552,
+      "num_raw_entries": 2140,
+      "num_shared_removed": 18,
+      "total_entries": 2122,
+      "duration_seconds": 8.16,
+      "error": null
+    }
+  ],
+  "preserved_libraries": [],
+  "successful": 5,
+  "failed": 0,
+  "num_shared_strings_removed": 98
+}
