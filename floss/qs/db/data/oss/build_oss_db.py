@@ -155,6 +155,7 @@ def run(
         capture_output=True,
     )
     if check and result.returncode != 0:
+        logger.error("command failed: %s\nstdout:\n%s\nstderr:\n%s", " ".join(cmd), result.stdout, result.stderr)
         raise subprocess.CalledProcessError(
             result.returncode,
             cmd,
