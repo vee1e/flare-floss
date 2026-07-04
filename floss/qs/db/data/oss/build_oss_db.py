@@ -54,6 +54,7 @@ import logging
 import pathlib
 import argparse
 import subprocess
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Set, Dict, List, Tuple, Iterable, Optional
 from dataclasses import field, dataclass
 
@@ -211,7 +212,7 @@ class Vcpkg:
         spec = f"{library}:{triplet}"
         logger.info("vcpkg install %s", spec)
         try:
-            run([str(self.exe), "install", spec, "--x-install-options=--x-jobs=8"])
+            run([str(self.exe), "install", spec])
         except subprocess.CalledProcessError as exc:
             output = (exc.stdout or "") + (exc.stderr or "")
             if "is only supported on" in output:
@@ -841,16 +842,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     metrics: List[LibraryMetrics] = []
     per_library_new: Dict[str, List[dict]] = {}
     failed = False
-    for library in config.libraries:
-        metric, entries = build_library(library, config, vcpkg, jh, converter)
-        metrics.append(metric)
-        # Even on error, preserve any partial entries so cross-library dedup
-        # still sees them (and so partial results aren't lost).
-        per_library_new[library] = entries
-        if metric.error:
-            failed = True
-            if not config.continue_on_error:
-                break
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(build_library, lib, config, vcpkg, jh, converter): lib for lib in config.libraries}
+        for future in as_completed(futures):
+            metric, entries = future.result()
+            metrics.append(metric)
+            # Even on error, preserve any partial entries so cross-library dedup
+            # still sees them (and so partial results aren't lost).
+            per_library_new[futures[future]] = entries
+            if metric.error:
+                failed = True
 
     # Discover all existing .jsonl.gz databases in the output directory. These
     # include libraries we are rebuilding (whose fresh entries will be merged
