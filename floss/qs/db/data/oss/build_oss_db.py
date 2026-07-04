@@ -54,7 +54,7 @@ import logging
 import pathlib
 import argparse
 import subprocess
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from typing import Set, Dict, List, Tuple, Iterable, Optional
 from dataclasses import field, dataclass
 
@@ -552,18 +552,12 @@ def build_library(
                 ", ".join(str(p.name) for p in lib_paths),
             )
 
-        all_jh_parts: List[str] = []
-        for lib_path in lib_paths:
+        def _extract_one(lib_path: pathlib.Path) -> str:
             logger.info("%s: extracting strings from %s", library, lib_path.name)
-            jh_text = jh.extract(
-                lib_path,
-                library,
-                version,
-                config.triplet,
-                config.compiler,
-                config.profile,
-            )
-            all_jh_parts.append(jh_text)
+            return jh.extract(lib_path, library, version, config.triplet, config.compiler, config.profile)
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            all_jh_parts: List[str] = list(pool.map(_extract_one, lib_paths))
 
         combined_jh_text = "\n".join(all_jh_parts)
         row_counts = count_jsonl_rows(combined_jh_text)
@@ -843,16 +837,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     metrics: List[LibraryMetrics] = []
     per_library_new: Dict[str, List[dict]] = {}
     failed = False
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        futures = {pool.submit(build_library, lib, config, vcpkg, jh, converter): lib for lib in config.libraries}
-        for future in as_completed(futures):
-            metric, entries = future.result()
-            metrics.append(metric)
-            # Even on error, preserve any partial entries so cross-library dedup
-            # still sees them (and so partial results aren't lost).
-            per_library_new[futures[future]] = entries
-            if metric.error:
-                failed = True
+    for library in config.libraries:
+        metric, entries = build_library(library, config, vcpkg, jh, converter)
+        metrics.append(metric)
+        # Even on error, preserve any partial entries so cross-library dedup
+        # still sees them (and so partial results aren't lost).
+        per_library_new[library] = entries
+        if metric.error:
+            failed = True
+            if not config.continue_on_error:
+                break
 
     # Discover all existing .jsonl.gz databases in the output directory. These
     # include libraries we are rebuilding (whose fresh entries will be merged
