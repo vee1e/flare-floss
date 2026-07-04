@@ -211,7 +211,7 @@ class Vcpkg:
         spec = f"{library}:{triplet}"
         logger.info("vcpkg install %s", spec)
         try:
-            run([str(self.exe), "install", spec])
+            run([str(self.exe), "install", spec, "--x-install-options=--x-jobs=8"])
         except subprocess.CalledProcessError as exc:
             output = (exc.stdout or "") + (exc.stderr or "")
             if "is only supported on" in output:
