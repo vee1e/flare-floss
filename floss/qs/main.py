@@ -1,11 +1,11 @@
 import io
-import struct
 import re
 import abc
 import sys
 import json
 import time
 import bisect
+import struct
 import hashlib
 import logging
 import pathlib
@@ -14,18 +14,22 @@ import datetime
 import functools
 import itertools
 import contextlib
-from typing import Set, Dict, List, Tuple, Literal, Callable, Iterable, Optional, Sequence
+from typing import Any, Set, Dict, List, Tuple, Literal, Callable, Iterable, Optional, Sequence
 from collections import defaultdict
 
 import pefile
-import machofile
 import colorama
 import lancelot
+import machofile  # type: ignore[import-untyped]
 import rich.traceback
 from pydantic import Field, BaseModel, ConfigDict
 from rich.text import Text
 from rich.style import Style
 from rich.console import Console
+from elftools.elf.elffile import ELFFile
+from elftools.elf.constants import P_FLAGS, SH_FLAGS
+from elftools.elf.relocation import RelocationSection
+from elftools.common.exceptions import ELFError
 
 import floss.main
 import floss.qs.db.gp
@@ -105,8 +109,8 @@ class Slice(BaseModel):
 
     def contains_range(self, offset: int, size: int) -> bool:
         """
-        checks if this slice's buffer contains the given range,
-        where offset is relative to the start of this slice's buffer.
+        checks if this slice contains the given range,
+        where offset is relative to the start of this slice.
         """
         if not (0 <= offset <= self.range.length):
             return False
@@ -605,6 +609,80 @@ def get_reloc_offsets(slice: Slice, pe: pefile.PE) -> Set[int]:
     return ret
 
 
+def elf_has_valid_sections(elf: ELFFile, limit: int) -> bool:
+    shoff = elf.header.get("e_shoff", 0)
+    shnum = elf.header.get("e_shnum", 0)
+    shentsize = elf.header.get("e_shentsize", 0)
+    if shoff == 0 or shnum == 0 or shentsize == 0:
+        return False
+
+    try:
+        expected_shentsize = elf.structs.Elf_Shdr.sizeof()
+    except Exception:
+        return False
+
+    if shentsize < expected_shentsize:
+        return False
+
+    sh_end = shoff + shnum * shentsize
+    return sh_end <= limit
+
+
+def elf_has_valid_segments(elf: ELFFile, limit: int) -> bool:
+    phoff = elf.header.get("e_phoff", 0)
+    phnum = elf.header.get("e_phnum", 0)
+    phentsize = elf.header.get("e_phentsize", 0)
+    if phnum == 0 or phnum >= 0xFFFF:
+        return False
+    if phoff == 0 or phentsize == 0:
+        return False
+
+    try:
+        expected_phentsize = elf.structs.Elf_Phdr.sizeof()
+    except Exception:
+        return False
+
+    if phentsize < expected_phentsize:
+        return False
+
+    ph_end = phoff + phnum * phentsize
+    return ph_end <= limit
+
+
+def iter_sections_robust(elf: ELFFile) -> Iterable[Any]:
+    try:
+        num_sections = elf.num_sections()
+    except Exception as e:
+        logger.warning("failed to get number of sections: %s", e)
+        return
+
+    for i in range(num_sections):
+        try:
+            yield elf.get_section(i)
+        except Exception as e:
+            logger.warning("failed to parse section %d: %s", i, e)
+            continue
+
+
+def get_relocations_elf(slice_: Slice, elf: ELFFile) -> List[Tuple[int, int]]:
+    if not elf_has_valid_sections(elf, slice_.range.length):
+        return []
+
+    ranges: List[Tuple[int, int]] = []
+
+    for section in iter_sections_robust(elf):
+        if isinstance(section, RelocationSection):
+            offset = section["sh_offset"]
+            size = section["sh_size"]
+
+            if not slice_.contains_range(offset, size):
+                logger.warning("relocation directory points to an invalid location, skipping")
+                continue
+
+            ranges.append((slice_.offset + offset, slice_.offset + offset + size - 1))
+    return _merge_overlapping_ranges(ranges)
+
+
 def check_is_xor(xor_key: int | None):
     if isinstance(xor_key, int):
         return ("#decoded",)
@@ -794,7 +872,55 @@ class Structure(BaseModel):
     name: str
 
 
-def collect_pe_structures(slice: Slice, pe: pefile.PE) -> Sequence[Structure]:
+def collect_elf_structures(slice_: Slice, elf: ELFFile) -> Sequence[Structure]:
+    structures: List[Structure] = []
+
+    # ELF file header: 52 bytes (32-bit) or 64 bytes (64-bit)
+    header_size = 52 if elf.elfclass == 32 else 64
+    if slice_.contains_range(0, header_size):
+        structures.append(Structure(slice=slice_.slice(0, header_size), name="elf header"))
+
+    # Program header table
+    phoff = elf.header["e_phoff"]
+    phentsize = elf.header["e_phentsize"]
+    phnum = elf.header["e_phnum"]
+    if phnum > 0 and phentsize > 0:
+        ph_total = phentsize * phnum
+        if slice_.contains_range(phoff, ph_total):
+            structures.append(Structure(slice=slice_.slice(phoff, ph_total), name="program header"))
+
+    # Section header table
+    shoff = elf.header["e_shoff"]
+    shentsize = elf.header["e_shentsize"]
+    shnum = elf.header["e_shnum"]
+    if shnum > 0 and shentsize > 0:
+        sh_total = shentsize * shnum
+        if slice_.contains_range(shoff, sh_total) and elf_has_valid_sections(elf, slice_.range.length):
+            structures.append(Structure(slice=slice_.slice(shoff, sh_total), name="section header"))
+
+    # String tables (.shstrtab, .strtab, .dynstr) and symbol tables (.symtab, .dynsym)
+    if elf_has_valid_sections(elf, slice_.range.length):
+        for section in iter_sections_robust(elf):
+            if section["sh_size"] == 0:
+                continue
+            if section["sh_type"] == "SHT_NOBITS":
+                continue
+
+            offset = section["sh_offset"]
+            size = section["sh_size"]
+
+            if not slice_.contains_range(offset, size):
+                continue
+
+            if section["sh_type"] == "SHT_STRTAB":
+                structures.append(Structure(slice=slice_.slice(offset, size), name="string table"))
+            elif section["sh_type"] in {"SHT_SYMTAB", "SHT_DYNSYM"}:
+                structures.append(Structure(slice=slice_.slice(offset, size), name="symbol table"))
+
+    return structures
+
+
+def collect_pe_structures(slice_: Slice, pe: pefile.PE) -> Sequence[Structure]:
     structures = []
 
     for section in sorted(pe.sections, key=lambda s: s.PointerToRawData):
@@ -803,7 +929,7 @@ def collect_pe_structures(slice: Slice, pe: pefile.PE) -> Sequence[Structure]:
 
         structures.append(
             Structure(
-                slice=slice.slice(offset, size),
+                slice=slice_.slice(offset, size),
                 name="section header",
             )
         )
@@ -825,7 +951,7 @@ def collect_pe_structures(slice: Slice, pe: pefile.PE) -> Sequence[Structure]:
 
             structures.append(
                 Structure(
-                    slice=slice.slice(offset, size),
+                    slice=slice_.slice(offset, size),
                     name="import table",
                 )
             )
@@ -847,7 +973,7 @@ def collect_pe_structures(slice: Slice, pe: pefile.PE) -> Sequence[Structure]:
 
                 structures.append(
                     Structure(
-                        slice=slice.slice(offset, size),
+                        slice=slice_.slice(offset, size),
                         name="import table",
                     )
                 )
@@ -863,7 +989,7 @@ def collect_pe_structures(slice: Slice, pe: pefile.PE) -> Sequence[Structure]:
 
                 structures.append(
                     Structure(
-                        slice=slice.slice(offset, size),
+                        slice=slice_.slice(offset, size),
                         name="export table",
                     )
                 )
@@ -888,7 +1014,7 @@ def collect_pe_structures(slice: Slice, pe: pefile.PE) -> Sequence[Structure]:
 
                 structures.append(
                     Structure(
-                        slice=slice.slice(offset, size),
+                        slice=slice_.slice(offset, size),
                         name="export table",
                     )
                 )
@@ -902,29 +1028,24 @@ def collect_pe_structures(slice: Slice, pe: pefile.PE) -> Sequence[Structure]:
                     size = len(forwarder_name)
                     structures.append(
                         Structure(
-                            slice=slice.slice(offset, size),
+                            slice=slice_.slice(offset, size),
                             name="export table",
                         )
                     )
 
-    if hasattr(pe, 'RICH_HEADER') and pe.RICH_HEADER:
+    if hasattr(pe, "RICH_HEADER") and pe.RICH_HEADER:
         key_bytes = pe.RICH_HEADER.key
 
-        rich_sig_offset = pe.__data__.find(b'Rich', 0x40, pe.DOS_HEADER.e_lfanew)
+        rich_sig_offset = pe.__data__.find(b"Rich", 0x40, pe.DOS_HEADER.e_lfanew)
         # The structure end is 'Rich' (4) + key (4) = 8 bytes
         rich_end = rich_sig_offset + 8
 
         # Find the start of rich header by looking for 'DanS' XORed with the key
-        xor_dans = bytes(a ^ b for a, b in zip(b'DanS', key_bytes))
+        xor_dans = bytes(a ^ b for a, b in zip(b"DanS", key_bytes))
         rich_start = pe.__data__.rfind(xor_dans, 0x40, rich_sig_offset)
 
         if rich_sig_offset != -1 and rich_start != -1:
-            structures.append(
-                Structure(
-                    slice=slice.slice(rich_start, rich_end - rich_start),
-                    name="rich header"
-                )
-            )
+            structures.append(Structure(slice=slice_.slice(rich_start, rich_end - rich_start), name="rich header"))
 
     return structures
 
@@ -1077,7 +1198,7 @@ class Layout(BaseModel, abc.ABC):
 class SectionLayout(Layout):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    section: pefile.SectionStructure
+    section: Optional[pefile.SectionStructure] = None
 
 
 class SegmentLayout(Layout):
@@ -1130,6 +1251,43 @@ class PELayout(Layout):
                 child.mark_structures(structures=structures, **kwargs)
 
 
+class ELFLayout(Layout):
+    xor_key: Optional[int]
+
+    # file offsets of bytes that are part of relocation sections
+    relocation_offsets: OffsetRanges
+
+    # file offsets of bytes that are recognized as code
+    code_offsets: OffsetRanges
+
+    structures_by_address: Dict[int, Structure]
+
+    def tag_strings(self, taggers: Sequence[Tagger]):
+        def check_is_xor_tagger(s: ExtractedString) -> Sequence[Tag]:
+            return check_is_xor(self.xor_key)
+
+        def check_is_reloc_tagger(s: ExtractedString) -> Sequence[Tag]:
+            return check_is_reloc(self.relocation_offsets, s)
+
+        def check_is_code_tagger(s: ExtractedString) -> Sequence[Tag]:
+            return check_is_code(self.code_offsets, s)
+
+        taggers = tuple(taggers) + (
+            check_is_xor_tagger,
+            check_is_reloc_tagger,
+            check_is_code_tagger,
+        )
+
+        super().tag_strings(taggers)
+
+    def mark_structures(self, structures: Optional[Tuple[Dict[int, Structure], ...]] = (), **kwargs):
+        for child in self.children:
+            if isinstance(child, (SectionLayout, SegmentLayout)):
+                child.mark_structures(structures=(structures or ()) + (self.structures_by_address,), **kwargs)
+            else:
+                child.mark_structures(structures=structures, **kwargs)
+
+
 class ResourceLayout(Layout):
     pass
 
@@ -1149,6 +1307,126 @@ class MachOLayout(Layout):
 
 class MachOFatLayout(Layout):
     pass
+
+
+def compute_elf_layout(slice_: Slice, xor_key: int | None) -> Layout:
+    data = slice_.data
+
+    elf = ELFFile(io.BytesIO(data))
+
+    structures = collect_elf_structures(slice_, elf)
+    relocation_offsets = OffsetRanges.from_merged_ranges(get_relocations_elf(slice_, elf))
+
+    structures_by_address: Dict[int, Structure] = {}
+    for structure in structures:
+        for offset in structure.slice.range:
+            structures_by_address[offset] = structure
+
+    # Collect valid file-backed sections/segments, sorted by offset, deduplicating overlaps.
+    # For sections: SHT_NOBITS sections (.bss, .noptrbss) have no file content; skip them.
+    # For segments: PT_LOAD segments are main focus.
+    # Also track executable parts (SHF_EXECINSTR or PF_X) for #code tagging.
+    layout_elements: List[Tuple[int, int, str, bool]] = []  # (offset, size, name, is_exec)
+
+    use_sections = elf_has_valid_sections(elf, slice_.range.length)
+    if use_sections:
+        for idx, section in enumerate(iter_sections_robust(elf)):
+            if section["sh_size"] == 0:
+                continue
+            if section["sh_type"] == "SHT_NOBITS":
+                continue
+
+            try:
+                name = section.name
+            except (ELFError, IndexError, UnicodeDecodeError) as e:
+                name = f"unnamed_section_{idx}"
+                logger.warning("failed to get section name for section %d: %s", idx, e)
+
+            offset = section["sh_offset"]
+            size = section["sh_size"]
+            is_exec = bool(section["sh_flags"] & SH_FLAGS.SHF_EXECINSTR)
+
+            if offset >= slice_.range.length:
+                logger.warning("section %s out of range", name)
+                continue
+
+            if offset + size > slice_.range.length:
+                size_orig = size
+                size = slice_.range.length - offset
+                logger.warning(
+                    "section size %s out of range, truncating from 0x%x to 0x%x bytes", name, size_orig, size
+                )
+
+            layout_elements.append((offset, size, name, is_exec))
+    else:
+        logger.debug("ELF section headers missing or invalid, using segments for layout")
+        if not elf_has_valid_segments(elf, slice_.range.length):
+            raise ELFError("ELF program headers missing or invalid")
+        num_segments = elf.num_segments()
+
+        for i in range(num_segments):
+            try:
+                segment_header = elf.get_segment(i).header
+
+                if segment_header["p_type"] not in ("PT_LOAD", 1):
+                    continue
+
+                if segment_header["p_filesz"] == 0:
+                    continue
+
+                offset = segment_header["p_offset"]
+                size = segment_header["p_filesz"]
+                is_exec = bool(segment_header["p_flags"] & P_FLAGS.PF_X)
+                name = f"segment_{i}_{segment_header['p_type']}"
+
+                if offset >= slice_.range.length:
+                    logger.warning("segment %s out of range", name)
+                    continue
+
+                if offset + size > slice_.range.length:
+                    size_orig = size
+                    size = slice_.range.length - offset
+                    logger.warning(
+                        "segment size %s out of range, truncating from 0x%x to 0x%x bytes", name, size_orig, size
+                    )
+
+                layout_elements.append((offset, size, name, is_exec))
+            except Exception as e:
+                logger.warning("failed to parse segment %d: %s", i, e)
+                continue
+
+    # Build code_offsets from executable parts before constructing the layout.
+    layout_elements.sort(key=lambda t: t[0])
+    exec_ranges: List[Tuple[int, int]] = [
+        (offset, offset + size) for offset, size, _name, is_exec in layout_elements if is_exec
+    ]
+    code_offsets = OffsetRanges.from_merged_ranges(_merge_overlapping_ranges(exec_ranges))
+
+    layout = ELFLayout(
+        slice=slice_,
+        name="elf",
+        xor_key=xor_key,
+        relocation_offsets=relocation_offsets,
+        code_offsets=code_offsets,
+        structures_by_address=structures_by_address,
+    )
+
+    if xor_key:
+        layout.name += f" (XOR decoded with key: 0x{xor_key:x})"
+
+    # Sort by offset, then skip any element that overlaps a previously added one.
+    cursor = 0
+    for offset, size, name, _is_exec in layout_elements:
+        if offset < cursor:
+            logger.debug("element %s overlaps previous element, skipping", name)
+            continue
+        if use_sections:
+            layout.add_child(SectionLayout(slice=slice_.slice(offset, size), name=name))
+        else:
+            layout.add_child(SegmentLayout(slice=slice_.slice(offset, size), name=name))
+        cursor = offset + size
+
+    return layout
 
 
 def _merge_overlapping_ranges(ranges: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
@@ -1178,11 +1456,16 @@ def _merge_overlapping_ranges(ranges: List[Tuple[int, int]]) -> List[Tuple[int, 
     return merged_ranges
 
 
-def _get_code_ranges(ws: lancelot.Workspace, pe: pefile.PE, slice_: Slice) -> List[Tuple[int, int]]:
+def _get_code_ranges(
+    be2: "lancelot.BinExport2",
+    idx: "lancelot.be2utils.BinExport2Index",
+    base_address: int,
+    pe: pefile.PE,
+    slice_: Slice,
+) -> List[Tuple[int, int]]:
     """
     Extract and return the raw, unmerged code ranges from a PE file.
     """
-    base_address = ws.base_address
 
     # cache because getting the offset is slow
     @functools.lru_cache(maxsize=None)
@@ -1194,59 +1477,89 @@ def _get_code_ranges(ws: lancelot.Workspace, pe: pefile.PE, slice_: Slice) -> Li
             return None
 
     code_ranges: List[Tuple[int, int]] = []
-    for function in ws.get_functions():
-        cfg = ws.build_cfg(function)
-        for bb in cfg.basic_blocks.values():
-            va = bb.address
-            rva = va - base_address
-            offset = get_offset_from_rva_cached(rva)
-            if offset is None:
+    for flow_graph in be2.flow_graph:
+        for basic_block_index in flow_graph.basic_block_index:
+            try:
+                basic_block = be2.basic_block[basic_block_index]
+            except IndexError:
+                logger.warning("lancelot basic block index %d out of range, skipping", basic_block_index)
                 continue
 
-            size = bb.length
+            current_range: Optional[Tuple[int, int]] = None
+            for _instruction_index, instruction, instruction_address in idx.basic_block_instructions(basic_block):
+                va = instruction_address
+                rva = va - base_address
+                offset = get_offset_from_rva_cached(rva)
+                if offset is None:
+                    if current_range is not None:
+                        code_ranges.append(current_range)
+                        current_range = None
+                    continue
 
-            if not slice_.contains_range(offset, size):
-                logger.warning("lancelot identified code at an invalid location, skipping basic block at 0x%x", rva)
-                continue
+                size = len(instruction.raw_bytes)
+                if size == 0:
+                    continue
 
-            code_ranges.append((slice_.offset + offset, slice_.offset + offset + size - 1))
+                if not slice_.contains_range(offset, size):
+                    logger.warning("lancelot identified code at an invalid location, skipping instruction at 0x%x", rva)
+                    if current_range is not None:
+                        code_ranges.append(current_range)
+                        current_range = None
+                    continue
+
+                start = slice_.offset + offset
+                end = slice_.offset + offset + size - 1
+                if current_range is None:
+                    current_range = (start, end)
+                elif start == current_range[1] + 1:
+                    current_range = (current_range[0], end)
+                else:
+                    code_ranges.append(current_range)
+                    current_range = (start, end)
+            if current_range is not None:
+                code_ranges.append(current_range)
     return code_ranges
 
 
-def compute_pe_layout(slice: Slice, xor_key: int | None) -> Layout:
-    data = slice.data
+def compute_pe_layout(slice_: Slice, xor_key: int | None) -> Layout:
+    data = slice_.data
 
     try:
         pe = pefile.PE(data=data)
     except pefile.PEFormatError as e:
         raise ValueError("pefile failed to load workspace") from e
 
-    structures = collect_pe_structures(slice, pe)
-    reloc_offsets = OffsetRanges.from_offsets(get_reloc_offsets(slice, pe))
+    structures = collect_pe_structures(slice_, pe)
+    reloc_offsets = OffsetRanges.from_offsets(get_reloc_offsets(slice_, pe))
 
     structures_by_address = {}
     for structure in structures:
         for offset in structure.slice.range:
             structures_by_address[offset] = structure
 
-    # lancelot only accepts bytes, not mmap
-    ws = None
+    be2: Optional[lancelot.BinExport2] = None
     with timing("lancelot: load workspace"):
         try:
-            ws = lancelot.from_bytes(data)
+            be2 = lancelot.get_binexport2_from_bytes(data)
         except ValueError as e:
             logger.warning("lancelot failed to load workspace: %s", e)
+        except BaseException as e:
+            if isinstance(e, (KeyboardInterrupt, SystemExit)):
+                raise
+            logger.warning("lancelot failed critically (panic): %s", e)
 
     # contains the file offsets of bytes that are part of recognized instructions.
     code_offsets = OffsetRanges()
-    if ws:
+    if be2:
         with timing("lancelot: find code"):
-            code_ranges = _get_code_ranges(ws, pe, slice)
+            base_address = lancelot.be2utils.find_be2_base_address(be2)
+            idx = lancelot.be2utils.BinExport2Index(be2)
+            code_ranges = _get_code_ranges(be2, idx, base_address, pe, slice_)
             merged_code_ranges = _merge_overlapping_ranges(code_ranges)
             code_offsets = OffsetRanges.from_merged_ranges(merged_code_ranges)
 
     layout = PELayout(
-        slice=slice,
+        slice=slice_,
         name="pe",
         xor_key=xor_key,
         reloc_offsets=reloc_offsets,
@@ -1269,24 +1582,24 @@ def compute_pe_layout(slice: Slice, xor_key: int | None) -> Layout:
         offset = section.get_PointerToRawData_adj()
         size = section.SizeOfRawData
 
-        if offset > slice.range.end:
+        if offset > slice_.range.end:
             logger.warning("section %s out of range", name)
             continue
 
-        if offset + size > slice.range.length:
+        if offset + size > slice_.range.length:
             size_orig = size
-            size = slice.range.length - offset
+            size = slice_.range.length - offset
             assert size >= 0
             logger.warning("section size %s out of range, truncating from 0x%x to 0x%x bytes", name, size_orig, size)
 
-        layout.add_child(SectionLayout(slice=slice.slice(offset, size), name=name, section=section))
+        layout.add_child(SectionLayout(slice=slice_.slice(offset, size), name=name, section=section))
 
     # segment that contains all data until the first section
     offset = 0
-    size = layout.children[0].offset - slice.range.offset
+    size = layout.children[0].offset - slice_.range.offset
     layout.add_child(
         SegmentLayout(
-            slice=slice.slice(offset, size),
+            slice=slice_.slice(offset, size),
             name="header",
         )
     )
@@ -1299,7 +1612,7 @@ def compute_pe_layout(slice: Slice, xor_key: int | None) -> Layout:
         size = layout.end - last_section.end
         layout.add_child(
             SegmentLayout(
-                slice=slice.slice(offset, size),
+                slice=slice_.slice(offset, size),
                 name="overlay",
             )
         )
@@ -1317,7 +1630,7 @@ def compute_pe_layout(slice: Slice, xor_key: int | None) -> Layout:
         else:
             overlay.add_child(
                 SegmentLayout(
-                    slice=slice.slice(security.VirtualAddress, security.Size - 1),
+                    slice=slice_.slice(security.VirtualAddress, security.Size - 1),
                     name="Authenticode digital signature",
                 )
             )
@@ -1334,7 +1647,7 @@ def compute_pe_layout(slice: Slice, xor_key: int | None) -> Layout:
             size = current.offset - prior.end
             layout.add_child(
                 SegmentLayout(
-                    slice=slice.slice(offset, size),
+                    slice=slice_.slice(offset, size),
                     name="gap",
                 )
             )
@@ -1366,7 +1679,7 @@ def compute_pe_layout(slice: Slice, xor_key: int | None) -> Layout:
 
                     size = entry.data.struct.Size
 
-                    if not slice.contains_range(offset, size):
+                    if not slice_.contains_range(offset, size):
                         logger.warning("resource '%s' points to an invalid location, skipping", "/".join(epath))
                         continue
 
@@ -1374,7 +1687,7 @@ def compute_pe_layout(slice: Slice, xor_key: int | None) -> Layout:
 
                     resources.append(
                         ResourceLayout(
-                            slice=slice.slice(offset, size),
+                            slice=slice_.slice(offset, size),
                             name="rsrc: " + "/".join(epath),
                         )
                     )
@@ -1456,9 +1769,7 @@ def _parse_fat_arches(data: bytes) -> List[Tuple[str, int, int]]:
         else:
             if offset + 20 > len(data):
                 break
-            cputype, cpusubtype, arch_offset, size, _align = struct.unpack(
-                endian + "IIIII", data[offset : offset + 20]
-            )
+            cputype, cpusubtype, arch_offset, size, _align = struct.unpack(endian + "IIIII", data[offset : offset + 20])
             offset += 20
 
         arch_name = _format_macho_arch(cputype, cpusubtype)
@@ -1591,9 +1902,7 @@ def _attach_nested_layout(parent: Layout, child: Layout):
         parent.add_child(child)
 
 
-def _parse_superblob_blobs(
-    slice_: Slice, cs_offset: int, cs_size: int
-) -> Sequence[Tuple[int, int, int]]:
+def _parse_superblob_blobs(slice_: Slice, cs_offset: int, cs_size: int) -> Sequence[Tuple[int, int, int]]:
     blobs: List[Tuple[int, int, int]] = []
     if cs_size <= 0:
         return blobs
@@ -1764,19 +2073,19 @@ def _populate_thin_macho_layout(layout: MachOLayout, slice_: Slice):
                 layout.structures_by_address[offset_value] = structure
 
 
-def compute_macho_layout(slice: Slice) -> Layout:
-    data = slice.data
+def compute_macho_layout(slice_: Slice) -> Layout:
+    data = slice_.data
     magic = _get_u32_be(data, 0)
 
     if magic in FAT_MAGICS:
-        layout = MachOFatLayout(slice=slice, name="macho (fat)")
+        layout = MachOFatLayout(slice=slice_, name="macho (fat)")
         arches = _parse_fat_arches(data)
         for arch_name, offset, size in arches:
-            if not slice.contains_range(offset, size):
+            if not slice_.contains_range(offset, size):
                 logger.warning("fat arch %s out of range, skipping", arch_name)
                 continue
 
-            arch_slice = slice.slice(offset, size)
+            arch_slice = slice_.slice(offset, size)
             arch_layout = MachOLayout(slice=arch_slice, name=f"macho: {arch_name}", arch=arch_name)
 
             _populate_thin_macho_layout(arch_layout, arch_slice)
@@ -1798,18 +2107,18 @@ def compute_macho_layout(slice: Slice) -> Layout:
     except Exception as e:
         logger.debug("failed to parse Mach-O header via machofile: %s", e)
 
-    layout = MachOLayout(slice=slice, name=f"macho: {arch_name}", arch=arch_name)
+    thin_layout = MachOLayout(slice=slice_, name=f"macho: {arch_name}", arch=arch_name)
 
-    _populate_thin_macho_layout(layout, slice)
+    _populate_thin_macho_layout(thin_layout, slice_)
 
-    return layout
+    return thin_layout
 
 
 def xor_static(data: bytes, i: int) -> bytes:
     return bytes(c ^ i for c in data)
 
 
-def compute_layout(slice: Slice) -> Layout:
+def compute_layout(slice_: Slice) -> Layout:
 
     # TODO don't do this for text or other obvious non-xored data
 
@@ -1822,24 +2131,24 @@ def compute_layout(slice: Slice) -> Layout:
     ]
 
     xor_key = None
-    decoded_slice = slice
+    decoded_slice = slice_
 
     # Try to find the XOR key
     for mz, key in mz_xor:
-        if slice.data.startswith(mz):
+        if slice_.data.startswith(mz):
             xor_key = key
             break
 
     # If XOR key is found, apply XOR decoding
     if xor_key is not None:
-        decoded_data = xor_static(slice.data, xor_key)
+        decoded_data = xor_static(slice_.data, xor_key)
         # Use base_offset to match the absolute offset,
         # so that Slice/Range logic based on absolute offsets still works
         # without requiring a large NULL-padded buffer.
         decoded_slice = Slice(
             buf=decoded_data,
-            range=Range(offset=slice.offset, length=len(decoded_data)),
-            base_offset=slice.offset,
+            range=Range(offset=slice_.offset, length=len(decoded_data)),
+            base_offset=slice_.offset,
         )
 
     # Try to parse as PE file
@@ -1849,18 +2158,22 @@ def compute_layout(slice: Slice) -> Layout:
             return compute_pe_layout(decoded_slice, xor_key)
         except ValueError as e:
             logger.debug("failed to parse as PE file: %s", e)
-            # Fall back to using the default binary layout
-            pass
-
-    if _is_macho_magic(_get_u32_be(slice.data, 0)):
+    elif _is_macho_magic(_get_u32_be(slice_.data, 0)):
         try:
-            return compute_macho_layout(slice)
+            return compute_macho_layout(slice_)
         except Exception as e:
             # TODO: narrow exception handling once machofile error types are clearer.
             logger.debug("failed to parse as Mach-O file: %s", e)
+    elif decoded_slice.data.startswith(b"\x7fELF"):
+        try:
+            return compute_elf_layout(decoded_slice, xor_key)
+        except ELFError as e:
+            logger.debug("failed to parse as ELF file: %s", e)
+    else:
+        logger.debug("unrecognized file format, falling back to binary layout")
 
     return SegmentLayout(
-        slice=slice,
+        slice=slice_,
         name="binary",
     )
 
@@ -2090,8 +2403,11 @@ def render_strings(
                         is_group_start = True
 
             line = render_string(
-                console.width, string, tag_rules,
-                prev_tags=prev_tags, prev_tags_width=prev_tags_width,
+                console.width,
+                string,
+                tag_rules,
+                prev_tags=prev_tags,
+                prev_tags_width=prev_tags_width,
                 is_group_end=is_group_end,
                 is_group_start=is_group_start,
             )
